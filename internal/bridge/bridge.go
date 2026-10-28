@@ -113,13 +113,12 @@ type Bridge struct {
 
 	st     State
 	me     string // the bot's Slack user id
-	mine   map[string]bool
 	misses int
 }
 
 // New sets a bridge up from its config and HOME, reading state.json.
 func New(cfg Config, h *hive.Client, name, home string) *Bridge {
-	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second, mine: map[string]bool{}}
+	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second}
 	b.Slack = &slack.Client{API: cfg.SlackAPI, AppToken: cfg.AppToken, BotToken: cfg.BotToken}
 	raw, err := os.ReadFile(b.statePath())
 	if err == nil {
@@ -356,7 +355,6 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 		b.reply(ctx, m.Channel, root, "The Hive didn't take that: "+Escape(err.Error()))
 		return
 	}
-	b.mine[msg.ID] = true
 	link.Thread = msg.Thread
 	b.st.Threads[key(m.Channel, root)] = link
 	if _, ok := b.st.Homes[key(link.Chat, link.Thread)]; !ok {
@@ -488,10 +486,9 @@ func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
 	if json.Unmarshal(e.Data, &m) != nil || m.Text == "" {
 		return
 	}
-	if m.From == "person" || m.From == b.Name || b.mine[m.ID] {
+	if m.From == "person" || m.From == b.Name {
 		return // what the person or this module wrote; Slack has it or it came from there
 	}
-	delete(b.mine, m.ID)
 	home, ok := b.st.Homes[key(m.Chat, m.Thread)]
 	if !ok && strings.HasPrefix(m.Chat, "agent:") {
 		// An agent's message to the person starts a thread of its own; it
