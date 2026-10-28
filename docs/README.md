@@ -36,8 +36,9 @@ It is an optional module, not one of the defaults.
 - **Out.** The module reads the journal's `chat.posted` lines. An answer in a
   thread that started in Slack is posted in that Slack thread. When `mirror` is
   on (the default), something the Hive starts itself is posted as a new message
-  in the chat's channel: the lead writing to you, an agent messaging you, a
-  notification in the lead's chat. Lead's posts go in the `lead` channel, or
+  in the chat's channel: the lead writing to you, or an agent messaging you.
+  The Hive's own notifications ("Merged: …") reach Slack only in a thread
+  Slack is already in. Lead's posts go in the `lead` channel, or
   your DM with the app once you've written there. Replying to that message in
   Slack continues the Hive's thread. Only what is posted after the module
   starts goes to Slack, not the history.

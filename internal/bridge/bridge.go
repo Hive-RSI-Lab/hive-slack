@@ -12,7 +12,8 @@
 // Slack is posted in that Slack thread; one in a thread that didn't (the
 // lead's own message to the person, an agent writing to the person) is posted
 // as a new message in the chat's channel when mirror is on, and that message
-// becomes the thread's home in Slack.
+// becomes the thread's home in Slack; the Hive's own notifications are posted
+// only in threads Slack is already in.
 package bridge
 
 import (
@@ -281,7 +282,7 @@ func (b *Bridge) track(e hive.Event) {
 		switch d.Status {
 		case "done", "blocked", "stopped":
 			delete(b.st.Runs, d.ID)
-			delete(b.st.Chats, "agent:"+d.ID)
+			b.forget("agent:" + d.ID)
 		default:
 			r, ok := b.st.Runs[d.ID]
 			if !ok {
@@ -289,6 +290,21 @@ func (b *Bridge) track(e hive.Event) {
 			}
 			r.Status = d.Status
 			b.st.Runs[d.ID] = r
+		}
+	}
+}
+
+// forget drops an ended agent's threads from the map.
+func (b *Bridge) forget(chat string) {
+	delete(b.st.Chats, chat)
+	for k, l := range b.st.Threads {
+		if l.Chat == chat {
+			delete(b.st.Threads, k)
+		}
+	}
+	for k := range b.st.Homes {
+		if strings.HasPrefix(k, chat+"/") {
+			delete(b.st.Homes, k)
 		}
 	}
 }
@@ -352,7 +368,7 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 	}
 	msg, err := b.Hive.Post(ctx, link.Chat, link.Thread, text)
 	if err != nil {
-		b.reply(ctx, m.Channel, root, "The Hive didn't take that: "+Escape(err.Error()))
+		b.reply(ctx, m.Channel, root, "The Hive didn't take that: "+Escape(err.Error())+". Send it again once that's sorted.")
 		return
 	}
 	link.Thread = msg.Thread
@@ -506,7 +522,8 @@ func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
 		}
 		return
 	}
-	if !b.Cfg.mirror() {
+	if !b.Cfg.mirror() || m.From == "hive" {
+		// The Hive's notifications reach Slack only in a thread Slack is in.
 		return
 	}
 	ch := b.channelFor(m.Chat)

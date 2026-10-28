@@ -343,6 +343,12 @@ func TestReachAnAgent(t *testing.T) {
 	if q := r.hivePosts(t, 2)[1]; q.Chat != p.Chat {
 		t.Fatalf("the reply went to %+v", q)
 	}
+	h.add("run.status", map[string]string{"id": "w-261028-1-abcdef1234", "status": "done"})
+	time.Sleep(150 * time.Millisecond) // the module reads the end
+	r.s.say(t, slack.Message{Channel: "CLEAD", User: "UME", Text: "still there?", TS: "1.5", ThreadTS: "1.3"})
+	if q := r.hivePosts(t, 3)[2]; q.Chat != "lead" {
+		t.Fatalf("a thread with an ended agent still went to %+v", q)
+	}
 }
 
 // What the Hive starts (the lead writing to the person unasked) is posted in
@@ -364,6 +370,12 @@ func TestMirror(t *testing.T) {
 	h.post("lead", m.Thread, "hive", "hive", "Merged: x")
 	if got := r.slackPosts(t, 2)[1]; got.Thread != sp[0].TS || got.Text != "Merged: x" {
 		t.Fatalf("Slack got %+v", got)
+	}
+
+	h.post("lead", "", "hive", "hive", "Merged: a thread Slack isn't in")
+	time.Sleep(150 * time.Millisecond)
+	if got := r.s.Posts(); len(got) != 2 {
+		t.Fatalf("a notification in a new thread reached Slack: %+v", got[2:])
 	}
 
 	off := false
