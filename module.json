@@ -1,0 +1,8 @@
+{
+  "name": "slack",
+  "description": "Slack as a door to the Hive: the person writes in a DM with the Hive's Slack app or a channel for the lead, a channel per project lead, or `to <agent>: …` for any running agent, and the answers come back in the same Slack thread (a Slack thread is one chat thread; the lead reads the lines as `Module slack: …`). It connects over Socket Mode, outbound only, so no port opens on this machine. The Slack app and its tokens are the person's: docs/README.md gives the app's manifest (slack-app.json) and where the tokens go, slack.json in the module's own HOME (.hive/modules/slack/, covered from every agent's sandbox), read only by this program. It carries in messages only from the Slack users slack.json names. `run` builds it once with the Go on PATH or the Hive's own (GOTOOLCHAIN=local, GOPROXY=off: nothing fetched).",
+  "exec": ["./run"],
+  "hooks": ["channel"],
+  "command": true,
+  "projects": ["*"]
+}
