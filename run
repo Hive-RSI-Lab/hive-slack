@@ -1,0 +1,20 @@
+#!/bin/sh
+# The slack module's program. Builds bin/slack from this folder's source the
+# first time (and after an update), then runs it with the arguments given:
+# none for the module's program, `check` to test slack.json, `help` ...
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+bin="$here/bin/slack"
+if [ ! -x "$bin" ] || [ -n "$(find "$here/cmd" "$here/internal" "$here/go.mod" "$here/app.go" "$here/slack-app.json" -newer "$bin" 2>/dev/null | head -n 1)" ]; then
+	if ! command -v go >/dev/null 2>&1; then
+		# The Hive's own Go (hive agent install --tool go) is beside the module's HOME.
+		for d in "$HOME/../../tools/go/bin" /usr/local/go/bin; do
+			[ -x "$d/go" ] && PATH="$d:$PATH" && break
+		done
+	fi
+	command -v go >/dev/null 2>&1 || { echo "slack: building needs Go 1.23 or later on PATH" >&2; exit 127; }
+	# GOTOOLCHAIN=local: build with the Go found here, never one fetched; the
+	# module has no dependencies to fetch either.
+	(cd "$here" && CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off go build -trimpath -o "$bin.tmp" ./cmd/slack && mv "$bin.tmp" "$bin")
+fi
+exec "$bin" "$@"
