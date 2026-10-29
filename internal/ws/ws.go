@@ -41,6 +41,10 @@ type Conn struct {
 	c   net.Conn
 	br  *bufio.Reader
 	wmu sync.Mutex
+	// Idle, when set, ends a Read that hears nothing at all, not even a
+	// ping or a pong, for this long: every frame moves the deadline on, so a
+	// quiet connection that still answers pings stays up.
+	Idle time.Duration
 }
 
 // Dial opens a WebSocket to rawURL. proxy (http.ProxyFromEnvironment, or nil
@@ -181,6 +185,9 @@ func (c *Conn) Read() ([]byte, error) {
 	var msg []byte
 	started := false
 	for {
+		if c.Idle > 0 {
+			c.c.SetReadDeadline(time.Now().Add(c.Idle))
+		}
 		fin, op, payload, err := ReadFrame(c.br)
 		if err != nil {
 			return nil, err

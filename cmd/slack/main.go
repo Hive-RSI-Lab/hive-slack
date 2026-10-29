@@ -105,7 +105,6 @@ func main() {
 		h.Report(ctx, map[string]any{"kind": "error", "text": "slack: " + err.Error()})
 		fail(err)
 	}
-	h.Report(ctx, map[string]any{"kind": "connected", "text": "connected to Slack"})
 	if err := b.Run(ctx); err != nil && ctx.Err() == nil {
 		fail(err)
 	}
