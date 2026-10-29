@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -100,6 +101,19 @@ type State struct {
 	LeadDM  string            `json:"lead_dm,omitempty"`
 	Runs    map[string]Run    `json:"runs"`
 	Seen    []string          `json:"seen"` // Slack messages already carried in, newest last
+	Outbox  []Pending         `json:"outbox,omitempty"`
+}
+
+// Pending is a chat line read from the journal and not yet in Slack. The
+// outbox is posted in order: a line waits until the ones before it are in
+// (or given up on), so a thread never reads out of order.
+type Pending struct {
+	Seq   int64        `json:"seq"`
+	Msg   hive.Message `json:"msg"`
+	First time.Time    `json:"first"` // when it was read
+	Tries int          `json:"tries,omitempty"`
+	Next  time.Time    `json:"next,omitempty"` // no try before this
+	Err   string       `json:"err,omitempty"`  // the last try's failure
 }
 
 // Bridge is the module's program.
@@ -118,6 +132,11 @@ type Bridge struct {
 	// told: a connection Slack refreshes, or one that drops and comes back
 	// a second later, is only logged.
 	ReportAfter time.Duration
+	// PostRetry is the first wait before posting a line Slack refused
+	// again; it doubles on each failure, to a minute. GiveUp is how long a
+	// line is tried before the Hive is told it was never delivered.
+	PostRetry time.Duration
+	GiveUp    time.Duration
 
 	st     State
 	me     string // the bot's Slack user id
@@ -127,7 +146,8 @@ type Bridge struct {
 
 // New sets a bridge up from its config and HOME, reading state.json.
 func New(cfg Config, h *hive.Client, name, home string) *Bridge {
-	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second, Retry: time.Second, ReportAfter: time.Minute}
+	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second, Retry: time.Second, ReportAfter: time.Minute,
+		PostRetry: time.Second, GiveUp: 10 * time.Minute}
 	b.Slack = &slack.Client{API: cfg.SlackAPI, AppToken: cfg.AppToken, BotToken: cfg.BotToken}
 	raw, err := os.ReadFile(b.statePath())
 	if err == nil {
@@ -295,9 +315,13 @@ func (b *Bridge) report(ctx context.Context, kind, text string, extra map[string
 	}
 }
 
-// PollHive reads the journal on from the cursor and carries each chat line out.
+// PollHive reads the journal on from the cursor, puts each chat line in the
+// outbox and posts what the outbox holds.
 func (b *Bridge) PollHive(ctx context.Context) error {
 	evs, err := b.Hive.Events(ctx, b.st.After)
+	if b.flush(ctx) && (err != nil || len(evs) == 0) {
+		b.save()
+	}
 	if err != nil {
 		// The daemon is gone or restarting; it starts this program again
 		// when it is back, so give up after half a minute of silence.
@@ -310,14 +334,98 @@ func (b *Bridge) PollHive(ctx context.Context) error {
 	for _, e := range evs {
 		b.track(e)
 		if e.Kind == "chat.posted" {
-			b.fromHive(ctx, e)
+			b.fromHive(e)
 		}
 		b.st.After = e.Seq
 	}
 	if len(evs) > 0 {
+		b.flush(ctx)
 		b.save()
 	}
 	return nil
+}
+
+// flush posts the outbox in order until it is empty or a line fails. A
+// failed line waits PostRetry, doubling, and holds the ones after it; a
+// line Slack will never take, or one still failing after GiveUp, is dropped
+// and reported to the Hive as undelivered. It says whether the outbox changed.
+func (b *Bridge) flush(ctx context.Context) bool {
+	changed := false
+	for len(b.st.Outbox) > 0 && ctx.Err() == nil {
+		p := &b.st.Outbox[0]
+		now := time.Now()
+		if now.Before(p.Next) {
+			break
+		}
+		changed = true
+		err := b.deliver(ctx, p.Msg)
+		if err == nil {
+			b.st.Outbox = b.st.Outbox[1:]
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		p.Tries++
+		p.Err = err.Error()
+		if permanent(err) || now.Sub(p.First) >= b.GiveUp {
+			b.undelivered(ctx, *p)
+			b.st.Outbox = b.st.Outbox[1:]
+			continue
+		}
+		wait := b.PostRetry
+		for i := 1; i < p.Tries && wait < time.Minute; i++ {
+			wait *= 2
+		}
+		if wait > time.Minute {
+			wait = time.Minute
+		}
+		var rl *slack.RateLimited
+		if errors.As(err, &rl) {
+			if s, e := strconv.Atoi(rl.After); e == nil && time.Duration(s)*time.Second > wait {
+				wait = time.Duration(s) * time.Second
+			}
+		}
+		p.Next = now.Add(wait)
+		b.logf("slack post (try %d): %v; again in %s", p.Tries, err, wait)
+		break
+	}
+	if len(b.st.Outbox) == 0 {
+		b.st.Outbox = nil
+	}
+	return changed
+}
+
+// permanent is a refusal no retry gets past.
+func permanent(err error) bool {
+	var ae *slack.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.Code {
+	case "channel_not_found", "not_in_channel", "is_archived", "msg_too_long", "no_text",
+		"restricted_action", "cannot_reply_to_message", "invalid_blocks", "invalid_arguments":
+		return true
+	}
+	return false
+}
+
+// undelivered tells the Hive a line never reached Slack, naming its chat
+// and thread, so the lead knows the person didn't get it.
+func (b *Bridge) undelivered(ctx context.Context, p Pending) {
+	m := p.Msg
+	who := m.Name
+	if who == "" {
+		who = m.From
+	}
+	excerpt := m.Text
+	if r := []rune(excerpt); len(r) > 200 {
+		excerpt = string(r[:200]) + "…"
+	}
+	b.report(ctx, "undelivered",
+		fmt.Sprintf("couldn't post %s's line in chat %s, thread %s to Slack after %d tries over %s (%s); the person didn't get it in Slack",
+			who, m.Chat, m.Thread, p.Tries, time.Since(p.First).Round(time.Second), p.Err),
+		map[string]any{"chat": m.Chat, "thread": m.Thread, "message": m.ID, "seq": p.Seq, "tries": p.Tries, "error": p.Err, "excerpt": excerpt})
 }
 
 // track keeps the list of runs "to <agent>: …" can reach.
@@ -550,8 +658,8 @@ func (b *Bridge) reply(ctx context.Context, channel, root, text string) {
 	}
 }
 
-// fromHive carries one chat.posted line out to Slack.
-func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
+// fromHive puts one chat.posted line in the outbox for Slack.
+func (b *Bridge) fromHive(e hive.Event) {
 	var m hive.Message
 	if json.Unmarshal(e.Data, &m) != nil || m.Text == "" {
 		return
@@ -559,6 +667,13 @@ func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
 	if m.From == "person" || m.From == b.Name {
 		return // what the person or this module wrote; Slack has it or it came from there
 	}
+	b.st.Outbox = append(b.st.Outbox, Pending{Seq: e.Seq, Msg: m, First: time.Now()})
+}
+
+// deliver posts one chat line in Slack, where its thread lives there. Where
+// it goes is worked out at the try, so a line waiting behind its thread's
+// first post follows it into the Slack thread that post starts.
+func (b *Bridge) deliver(ctx context.Context, m hive.Message) error {
 	home, ok := b.st.Homes[key(m.Chat, m.Thread)]
 	if !ok && strings.HasPrefix(m.Chat, "agent:") {
 		// An agent's message to the person starts a thread of its own; it
@@ -571,29 +686,27 @@ func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
 	}
 	if ok {
 		ch, ts := split(home)
-		if _, err := b.Slack.Post(ctx, ch, ts, text); err != nil {
-			b.logf("slack post: %v", err)
-		}
-		return
+		_, err := b.Slack.Post(ctx, ch, ts, text)
+		return err
 	}
 	if !b.Cfg.mirror() || m.From == "hive" {
 		// The Hive's notifications reach Slack only in a thread Slack is in.
-		return
+		return nil
 	}
 	ch := b.channelFor(m.Chat)
 	if ch == "" {
-		return
+		return nil
 	}
 	ts, err := b.Slack.Post(ctx, ch, "", text)
 	if err != nil {
-		b.logf("slack post: %v", err)
-		return
+		return err
 	}
 	b.st.Threads[key(ch, ts)] = Link{Chat: m.Chat, Thread: m.Thread}
 	b.st.Homes[key(m.Chat, m.Thread)] = key(ch, ts)
 	if strings.HasPrefix(m.Chat, "agent:") {
 		b.st.Chats[m.Chat] = key(ch, ts)
 	}
+	return nil
 }
 
 // channelFor is the Slack channel a chat's new threads go to.

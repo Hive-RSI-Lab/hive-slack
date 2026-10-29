@@ -29,7 +29,10 @@ type fakeSlack struct {
 	conn  net.Conn
 	n     int
 	opens int
-	shut  bool // apps.connections.open refuses, as when Slack is out of reach
+	shut  bool   // apps.connections.open refuses, as when Slack is out of reach
+	fail  int    // chat.postMessage fails this many more posts (-1: all of them)
+	code  string // with this error ("" for a 500 with no body)
+	tries int    // chat.postMessage calls, failed ones too
 }
 
 type slackPost struct{ Channel, Thread, Text, TS string }
@@ -69,6 +72,20 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		var b struct{ Channel, Text, Thread_TS string }
 		json.NewDecoder(r.Body).Decode(&b)
 		f.mu.Lock()
+		f.tries++
+		if f.fail != 0 {
+			if f.fail > 0 {
+				f.fail--
+			}
+			code := f.code
+			f.mu.Unlock()
+			if code == "" {
+				w.WriteHeader(500)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": code})
+			return
+		}
 		f.n++
 		ts := fmt.Sprintf("2000.%04d", f.n)
 		f.posts = append(f.posts, slackPost{b.Channel, b.Thread_TS, b.Text, ts})
@@ -128,9 +145,9 @@ func (f *fakeSlack) Posts() []slackPost {
 
 // fakeHive is the daemon's API as a channel module sees it.
 type fakeHive struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	events []hive.Event
+	srv     *httptest.Server
+	mu      sync.Mutex
+	events  []hive.Event
 	posts   []hive.Message
 	chats   map[string]bool
 	reports []map[string]any
@@ -531,5 +548,128 @@ func writeFile(t *testing.T, path, s string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (f *fakeSlack) failing(n int, code string) {
+	f.mu.Lock()
+	f.fail, f.code = n, code
+	f.mu.Unlock()
+}
+
+// A Slack that fails posts and then recovers gets each of the Hive's lines
+// once, in order, in its thread: a mirrored thread's first line and the
+// reply that follows it, both held until Slack takes them.
+func TestRetriesFailedPosts(t *testing.T) {
+	r := start(t, nil, Config{Lead: "CLEAD"}, func(b *Bridge) { b.PostRetry = 20 * time.Millisecond })
+	r.s.failing(3, "")
+	m := r.h.post("lead", "", "lead-lead-1", "lead", "first")
+	r.h.post("lead", m.Thread, "lead-lead-1", "lead", "second")
+	r.h.post("lead", m.Thread, "hive", "hive", "third")
+	sp := r.slackPosts(t, 3)
+	time.Sleep(100 * time.Millisecond)
+	sp = r.s.Posts()
+	if len(sp) != 3 || !strings.HasSuffix(sp[0].Text, "first") || sp[0].Thread != "" ||
+		!strings.HasSuffix(sp[1].Text, "second") || sp[1].Thread != sp[0].TS ||
+		sp[2].Text != "third" || sp[2].Thread != sp[0].TS {
+		t.Fatalf("Slack got %+v", sp)
+	}
+	r.s.mu.Lock()
+	tries := r.s.tries
+	r.s.mu.Unlock()
+	if tries != 6 {
+		t.Fatalf("%d tries for 3 failures and 3 posts", tries)
+	}
+	if st := r.b.State(); len(st.Outbox) != 0 {
+		t.Fatalf("the outbox still holds %+v", st.Outbox)
+	}
+	for _, rep := range r.h.Reports() {
+		if rep["kind"] == "undelivered" {
+			t.Fatalf("a delivered line was reported: %v", rep)
+		}
+	}
+}
+
+// A line Slack still refuses after GiveUp is reported to the Hive as
+// undelivered, naming its chat and thread, and the next line goes on.
+func TestReportsUndelivered(t *testing.T) {
+	r := start(t, nil, Config{Lead: "CLEAD"}, func(b *Bridge) { b.PostRetry, b.GiveUp = 10*time.Millisecond, 150*time.Millisecond })
+	r.s.say(t, slack.Message{Channel: "CLEAD", User: "UME", Text: "hi", TS: "1.1"})
+	p := r.hivePosts(t, 1)[0]
+	r.s.failing(-1, "service_unavailable")
+	r.h.post("lead", p.Thread, "lead-lead-1", "lead", "lost")
+	var u map[string]any
+	waitFor(t, "an undelivered report", func() bool {
+		for _, rep := range r.h.Reports() {
+			if rep["kind"] == "undelivered" {
+				u = rep
+				return true
+			}
+		}
+		return false
+	})
+	if u["chat"] != "lead" || u["thread"] != p.Thread || u["excerpt"] != "lost" ||
+		!strings.Contains(u["text"].(string), "service_unavailable") || !strings.Contains(u["text"].(string), p.Thread) {
+		t.Fatalf("reported %v", u)
+	}
+	r.s.failing(0, "")
+	r.h.post("lead", p.Thread, "lead-lead-1", "lead", "kept")
+	sp := r.slackPosts(t, 1)
+	if len(sp) != 1 || !strings.HasSuffix(sp[0].Text, "kept") || sp[0].Thread != "1.1" {
+		t.Fatalf("Slack got %+v", sp)
+	}
+}
+
+// A refusal no retry gets past (the channel is gone) is reported at once.
+func TestPermanentRefusalReported(t *testing.T) {
+	r := start(t, nil, Config{Lead: "CGONE"}, func(b *Bridge) { b.GiveUp = time.Hour })
+	r.s.failing(-1, "channel_not_found")
+	r.h.post("lead", "", "lead-lead-1", "lead", "anyone?")
+	waitFor(t, "an undelivered report", func() bool {
+		for _, rep := range r.h.Reports() {
+			if rep["kind"] == "undelivered" && rep["chat"] == "lead" && strings.Contains(rep["error"].(string), "channel_not_found") {
+				return true
+			}
+		}
+		return false
+	})
+	r.s.mu.Lock()
+	tries := r.s.tries
+	r.s.mu.Unlock()
+	if tries != 1 {
+		t.Fatalf("a permanent refusal was tried %d times", tries)
+	}
+}
+
+// Lines still in the outbox when the module stops are posted after a restart.
+func TestOutboxSurvivesRestart(t *testing.T) {
+	h := newFakeHive(t)
+	s := newFakeSlack(t)
+	home := t.TempDir()
+	cfg := Config{AppToken: "xapp-app", BotToken: "xoxb-bot", SlackAPI: s.srv.URL + "/api/", People: []string{"UME"}, Lead: "CLEAD"}
+	b := New(cfg, &hive.Client{API: h.srv.URL, Token: "tok"}, "slack", home)
+	ctx := context.Background()
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.failing(-1, "")
+	h.post("lead", "", "lead-lead-1", "lead", "before the restart")
+	if err := b.PollHive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(b.State().Outbox); n != 1 {
+		t.Fatalf("the outbox holds %d lines", n)
+	}
+	s.failing(0, "")
+	b2 := New(cfg, &hive.Client{API: h.srv.URL, Token: "tok"}, "slack", home)
+	if err := b2.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b2.st.Outbox[0].Next = time.Time{} // don't wait out the first retry
+	if err := b2.PollHive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sp := s.Posts(); len(sp) != 1 || !strings.HasSuffix(sp[0].Text, "before the restart") {
+		t.Fatalf("after a restart Slack got %+v", sp)
 	}
 }

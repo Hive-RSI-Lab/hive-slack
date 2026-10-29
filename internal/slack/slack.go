@@ -89,13 +89,18 @@ func (c *Client) call(ctx context.Context, token, method string, body, out any) 
 		return fmt.Errorf("slack %s: %s: %v", method, resp.Status, err)
 	}
 	if !res.OK {
-		return fmt.Errorf("slack %s: %s", method, res.Error)
+		return &APIError{Method: method, Code: res.Error}
 	}
 	if out != nil {
 		return json.Unmarshal(buf.Bytes(), out)
 	}
 	return nil
 }
+
+// APIError is Slack's {"ok": false, "error": code}.
+type APIError struct{ Method, Code string }
+
+func (e *APIError) Error() string { return "slack " + e.Method + ": " + e.Code }
 
 // RateLimited is Slack's 429.
 type RateLimited struct{ After string }
