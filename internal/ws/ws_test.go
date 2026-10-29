@@ -97,3 +97,33 @@ func TestDialRefused(t *testing.T) {
 		t.Fatal("an http:// address dialled")
 	}
 }
+
+// With Idle set, a connection that sends no message but keeps pinging stays
+// readable past Idle; one that falls silent times out.
+func TestIdleCountsEveryFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, _ := w.(http.Hijacker).Hijack()
+		defer conn.Close()
+		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + Accept(r.Header.Get("Sec-Websocket-Key")) + "\r\n\r\n")
+		rw.Flush()
+		for i := 0; i < 8; i++ {
+			time.Sleep(50 * time.Millisecond)
+			WriteFrame(conn, opPing, nil, nil)
+		}
+		WriteFrame(conn, opText, []byte("late"), nil)
+		time.Sleep(time.Second)
+	}))
+	defer srv.Close()
+	c, err := Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Idle = 200 * time.Millisecond
+	if msg, err := c.Read(); err != nil || string(msg) != "late" {
+		t.Fatalf("read %q, %v: pings didn't keep the read alive", msg, err)
+	}
+	if _, err := c.Read(); err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("a silent connection read as %v, not a timeout", err)
+	}
+}
