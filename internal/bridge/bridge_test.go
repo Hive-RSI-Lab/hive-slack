@@ -29,12 +29,23 @@ type fakeSlack struct {
 	conn  net.Conn
 	n     int
 	opens int
+	// conversations.*: the channels the bot can see, names taken by ones it
+	// can't, what it made, invited, archived and set as topics, and the bot
+	// token's scopes ("" says none).
+	chans    []slack.Channel
+	hidden   []string
+	made     []string
+	invites  []string
+	archived []string
+	topics   map[string]string
+	scopes   string
+	noScope  bool // conversations.* answer missing_scope
 }
 
 type slackPost struct{ Channel, Thread, Text, TS string }
 
 func newFakeSlack(t *testing.T) *fakeSlack {
-	f := &fakeSlack{}
+	f := &fakeSlack{topics: map[string]string{}}
 	mux := http.NewServeMux()
 	auth := func(w http.ResponseWriter, r *http.Request, want string) bool {
 		if r.Header.Get("Authorization") != "Bearer "+want {
@@ -45,6 +56,11 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 	}
 	mux.HandleFunc("/api/auth.test", func(w http.ResponseWriter, r *http.Request) {
 		if auth(w, r, "xoxb-bot") {
+			f.mu.Lock()
+			if f.scopes != "" {
+				w.Header().Set("X-OAuth-Scopes", f.scopes)
+			}
+			f.mu.Unlock()
 			json.NewEncoder(w).Encode(map[string]any{"ok": true, "user_id": "UBOT", "team": "Lab"})
 		}
 	})
@@ -68,6 +84,91 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		f.posts = append(f.posts, slackPost{b.Channel, b.Thread_TS, b.Text, ts})
 		f.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": ts})
+	})
+	conv := func(method string, do func(r *http.Request) map[string]any) {
+		mux.HandleFunc("/api/conversations."+method, func(w http.ResponseWriter, r *http.Request) {
+			if !auth(w, r, "xoxb-bot") {
+				return
+			}
+			if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid_form_data"})
+				return
+			}
+			r.ParseForm()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.noScope {
+				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "missing_scope", "needed": "channels:read"})
+				return
+			}
+			out := do(r)
+			if out["error"] == nil {
+				out["ok"] = true
+			}
+			json.NewEncoder(w).Encode(out)
+		})
+	}
+	find := func(id string) *slack.Channel {
+		for i := range f.chans {
+			if f.chans[i].ID == id {
+				return &f.chans[i]
+			}
+		}
+		return nil
+	}
+	conv("list", func(r *http.Request) map[string]any {
+		var out []slack.Channel
+		for _, c := range f.chans {
+			if !c.IsArchived && (!c.IsPrivate || c.IsMember) {
+				out = append(out, c)
+			}
+		}
+		return map[string]any{"channels": out}
+	})
+	conv("create", func(r *http.Request) map[string]any {
+		name := r.Form.Get("name")
+		for _, c := range f.chans {
+			if c.Name == name {
+				return map[string]any{"error": "name_taken"}
+			}
+		}
+		for _, h := range f.hidden {
+			if h == name {
+				return map[string]any{"error": "name_taken"}
+			}
+		}
+		c := slack.Channel{ID: fmt.Sprintf("C%d", len(f.chans)+100), Name: name, IsPrivate: r.Form.Get("is_private") == "true", IsMember: true}
+		f.chans = append(f.chans, c)
+		f.made = append(f.made, name+map[bool]string{true: " private", false: " public"}[c.IsPrivate])
+		return map[string]any{"channel": c}
+	})
+	conv("join", func(r *http.Request) map[string]any {
+		c := find(r.Form.Get("channel"))
+		if c == nil || c.IsPrivate {
+			return map[string]any{"error": "method_not_supported_for_channel_type"}
+		}
+		c.IsMember = true
+		return map[string]any{}
+	})
+	conv("invite", func(r *http.Request) map[string]any {
+		if c := find(r.Form.Get("channel")); c == nil || !c.IsMember {
+			return map[string]any{"error": "not_in_channel"}
+		}
+		f.invites = append(f.invites, r.Form.Get("channel")+"/"+r.Form.Get("users"))
+		return map[string]any{}
+	})
+	conv("archive", func(r *http.Request) map[string]any {
+		c := find(r.Form.Get("channel"))
+		if c == nil || !c.IsMember {
+			return map[string]any{"error": "not_in_channel"}
+		}
+		c.IsArchived = true
+		f.archived = append(f.archived, c.Name)
+		return map[string]any{}
+	})
+	conv("setTopic", func(r *http.Request) map[string]any {
+		f.topics[r.Form.Get("channel")] = r.Form.Get("topic")
+		return map[string]any{}
 	})
 	mux.HandleFunc("/socket", func(w http.ResponseWriter, r *http.Request) {
 		conn, rw, _ := w.(http.Hijacker).Hijack()
@@ -218,7 +319,11 @@ type rig struct {
 
 func start(t *testing.T, h *fakeHive, cfg Config) *rig {
 	t.Helper()
-	s := newFakeSlack(t)
+	return startWith(t, newFakeSlack(t), h, cfg)
+}
+
+func startWith(t *testing.T, s *fakeSlack, h *fakeHive, cfg Config) *rig {
+	t.Helper()
 	if h == nil {
 		h = newFakeHive(t)
 	}

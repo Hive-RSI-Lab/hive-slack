@@ -42,8 +42,42 @@ It is an optional module, not one of the defaults.
   your DM with the app once you've written there. Replying to that message in
   Slack continues the Hive's thread. Only what is posted after the module
   starts goes to Slack, not the history.
+- **Channels.** The module makes and keeps its own channels (below); in a
+  channel shared by several projects, `<project>: …` reaches that project's
+  lead, and anything else the lead (or the lead's chat, when the channel holds
+  it).
 - **State.** `state.json` beside slack.json holds the journal cursor, the
-  thread map and the runs it has seen, so a restart goes on where it stopped.
+  thread map, the runs it has seen and the channel map, so a restart goes on
+  where it stopped.
+
+## Channels: the Hive keeps them
+
+The lead lays out the Slack, at once and with no file to edit: a line in its
+own chat (`hive agent message --to person --text "slack: …"`) that starts
+`slack:` is a command to this module, done there and answered in the same
+thread, not sent to Slack. A project's lead can do the same in its chat, and
+you can write the same line in Slack or in the control center. No one else
+steers it: an agent's `slack:` line is an ordinary message.
+
+- `slack: channel <name> [lead] [project …]` makes the private channel
+  `#name`, or takes the one of that name already there (joining a public
+  one), invites the people slack.json names, puts the lead's chat (`lead`) and
+  those projects' leads in it, and sets its topic to whom it reaches. A
+  project already in another channel moves. A channel may hold several
+  projects.
+- `slack: drop <project …>` takes projects out of their channel.
+- `slack: archive <name>` archives `#name`, the module's or any other it can
+  see.
+- `slack: channels` (or `channels` in Slack) lists the channels and whom each
+  reaches.
+
+When the Hive retires a project (`project.removed` in the journal), the project
+leaves its channel, and a channel left holding nothing is archived.
+
+A private channel made by someone else is one the app can't see until it is
+invited: `/invite @Hive` there first, and the module says so when it meets
+one. The `lead` and `projects` fields of slack.json still name channels made by
+hand; a channel the module keeps takes precedence.
 
 ## Set it up (your steps)
 
@@ -56,7 +90,17 @@ The Slack app and its tokens are yours. The Hive never makes them.
    for these bot scopes:
    - `chat:write`: post the answers;
    - `channels:history`, `groups:history`, `im:history`: read the messages in
-     the channels you invite it to and your DM with it.
+     its channels and your DM with it;
+   - `channels:read`, `groups:read`, `channels:manage`, `groups:write`,
+     `channels:join`, `channels:write.topic`, `groups:write.topic`: make,
+     find, join, archive and title its channels, and invite you to them.
+
+   **An app made from an older manifest** lacks the channel scopes; the
+   module reports that once when it starts and in answer to any `slack:`
+   command. The one step: on the app's **App Manifest** page at
+   <https://api.slack.com/apps>, paste the new manifest (`hive slack manifest`),
+   save, then **Install App**, **Reinstall to Workspace**. The tokens stay the
+   same, so slack.json doesn't change.
    It subscribes to the `message.channels`, `message.groups` and `message.im`
    events.
 2. **Install it.** Under **Install App**, click **Install to Workspace**, then
@@ -66,10 +110,8 @@ The Slack app and its tokens are yours. The Hive never makes them.
    scope `connections:write`, then copy the token (`xapp-…`).
 4. **Your member id.** In Slack, open your profile, then **⋮**, then **Copy
    member ID** (`U…`).
-5. **Channels (optional).** A DM with the app always reaches the lead. For a
-   channel instead, or one per project lead, make the channel, run
-   `/invite @Hive` in it, and copy its id from the bottom of the channel's
-   details (`C…`).
+5. **Channels: nothing to do.** A DM with the app always reaches the lead,
+   and the Hive makes its own channels and invites you (see Channels above).
 6. **Write slack.json** in the module's own HOME (`hive slack where` prints
    the path; it is `<workspace>/.hive/modules/slack/slack.json`):
 
@@ -77,14 +119,12 @@ The Slack app and its tokens are yours. The Hive never makes them.
    {
      "app_token": "xapp-…",
      "bot_token": "xoxb-…",
-     "people": ["U…"],
-     "lead": "C…",
-     "projects": {"hive": "C…", "hive-hwde": "C…"},
-     "mirror": true
+     "people": ["U…"]
    }
    ```
 
-   Only `app_token`, `bot_token` and `people` are needed. Then run
+   That is all it needs. `"mirror": false` keeps the Hive's own new threads
+   out of Slack. Then run
    `chmod 600` on it (the module sets that mode too when it starts).
 7. **Check it.** `hive slack check` reads slack.json, opens a Socket Mode
    connection with the app token and asks Slack who the bot token is.
@@ -127,4 +167,6 @@ kind `waiting`) what is missing, so it can be installed before the app is made.
 `go test ./...` runs against a fake Slack (its Web API and a Socket Mode
 WebSocket on localhost) and a fake Hive API. The tests cover DMs to the lead
 and back, threads, project leads, reaching an agent, mirroring, who is let in,
-refusals, restarts, and the WebSocket framing.
+refusals, restarts, the channels the lead lays out (made, taken, moved,
+archived, a retired project's), an app without the scopes, and the WebSocket
+framing.

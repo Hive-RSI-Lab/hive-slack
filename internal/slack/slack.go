@@ -23,6 +23,8 @@ type Client struct {
 	AppToken string // xapp-…: opens Socket Mode connections
 	BotToken string // xoxb-…: posts messages
 	HTTP     *http.Client
+	// Scopes is the bot token's scopes, as Slack last said (X-OAuth-Scopes).
+	Scopes string
 	// Proxy picks the proxy for the WebSocket (http.ProxyFromEnvironment);
 	// nil dials directly.
 	Proxy func(*http.Request) (*url.URL, error)
@@ -56,19 +58,26 @@ func (c *Client) http() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
-// call POSTs a Web API method with a JSON body and decodes its answer into
-// out; Slack's {"ok": false, "error": …} comes back as an error.
+// call POSTs a Web API method and decodes its answer into out; Slack's
+// {"ok": false, "error": …} comes back as an *Error. A url.Values body is
+// sent as a form (the read methods take no JSON), anything else as JSON.
 func (c *Client) call(ctx context.Context, token, method string, body, out any) error {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return err
+	var raw []byte
+	ctype := "application/json; charset=utf-8"
+	if f, ok := body.(url.Values); ok {
+		raw, ctype = []byte(f.Encode()), "application/x-www-form-urlencoded"
+	} else {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
+			return err
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base()+method, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Content-Type", ctype)
 	resp, err := c.http().Do(req)
 	if err != nil {
 		return err
@@ -77,9 +86,13 @@ func (c *Client) call(ctx context.Context, token, method string, body, out any) 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return &RateLimited{After: resp.Header.Get("Retry-After")}
 	}
+	if sc := resp.Header.Get("X-OAuth-Scopes"); sc != "" && token == c.BotToken {
+		c.Scopes = sc
+	}
 	var res struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
+		OK     bool   `json:"ok"`
+		Error  string `json:"error"`
+		Needed string `json:"needed"`
 	}
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
@@ -89,12 +102,32 @@ func (c *Client) call(ctx context.Context, token, method string, body, out any) 
 		return fmt.Errorf("slack %s: %s: %v", method, resp.Status, err)
 	}
 	if !res.OK {
-		return fmt.Errorf("slack %s: %s", method, res.Error)
+		return &Error{Method: method, Code: res.Error, Needed: res.Needed}
 	}
 	if out != nil {
 		return json.Unmarshal(buf.Bytes(), out)
 	}
 	return nil
+}
+
+// Error is a Web API method's refusal: Code is Slack's error string
+// ("missing_scope", "name_taken", …) and Needed the scope it lacked.
+type Error struct{ Method, Code, Needed string }
+
+func (e *Error) Error() string {
+	if e.Needed != "" {
+		return fmt.Sprintf("slack %s: %s (needs %s)", e.Method, e.Code, e.Needed)
+	}
+	return fmt.Sprintf("slack %s: %s", e.Method, e.Code)
+}
+
+// Code is Slack's error string for err, or "" when it isn't Slack's refusal.
+func Code(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code
+	}
+	return ""
 }
 
 // RateLimited is Slack's 429.
@@ -207,4 +240,77 @@ func (c *Client) Listen(ctx context.Context, handle func(Message)) error {
 			}
 		}
 	}
+}
+
+// Channel is a conversation the bot can see.
+type Channel struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	IsPrivate  bool   `json:"is_private"`
+	IsMember   bool   `json:"is_member"`
+	IsArchived bool   `json:"is_archived"`
+}
+
+// Channels lists the public channels and the private ones the bot is in
+// (conversations.list), archived ones left out.
+func (c *Client) Channels(ctx context.Context) ([]Channel, error) {
+	var all []Channel
+	cursor := ""
+	for {
+		f := url.Values{"types": {"public_channel,private_channel"}, "exclude_archived": {"true"}, "limit": {"1000"}}
+		if cursor != "" {
+			f.Set("cursor", cursor)
+		}
+		var out struct {
+			Channels []Channel `json:"channels"`
+			Meta     struct {
+				Next string `json:"next_cursor"`
+			} `json:"response_metadata"`
+		}
+		if err := c.call(ctx, c.BotToken, "conversations.list", f, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Channels...)
+		if cursor = out.Meta.Next; cursor == "" {
+			return all, nil
+		}
+	}
+}
+
+// Create makes a channel, private unless public is set, and returns its id.
+func (c *Client) Create(ctx context.Context, name string, public bool) (string, error) {
+	var out struct {
+		Channel Channel `json:"channel"`
+	}
+	err := c.call(ctx, c.BotToken, "conversations.create", url.Values{"name": {name}, "is_private": {fmt.Sprint(!public)}}, &out)
+	return out.Channel.ID, err
+}
+
+// Join puts the bot in a public channel.
+func (c *Client) Join(ctx context.Context, channel string) error {
+	return c.call(ctx, c.BotToken, "conversations.join", url.Values{"channel": {channel}}, nil)
+}
+
+// Invite adds a user to a channel; one already there is no error.
+func (c *Client) Invite(ctx context.Context, channel, user string) error {
+	err := c.call(ctx, c.BotToken, "conversations.invite", url.Values{"channel": {channel}, "users": {user}}, nil)
+	switch Code(err) {
+	case "already_in_channel", "cant_invite_self":
+		return nil
+	}
+	return err
+}
+
+// Archive archives a channel; one already archived is no error.
+func (c *Client) Archive(ctx context.Context, channel string) error {
+	err := c.call(ctx, c.BotToken, "conversations.archive", url.Values{"channel": {channel}}, nil)
+	if Code(err) == "already_archived" {
+		return nil
+	}
+	return err
+}
+
+// Topic sets a channel's topic.
+func (c *Client) Topic(ctx context.Context, channel, topic string) error {
+	return c.call(ctx, c.BotToken, "conversations.setTopic", url.Values{"channel": {channel}, "topic": {topic}}, nil)
 }
