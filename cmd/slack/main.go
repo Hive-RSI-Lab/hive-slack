@@ -45,6 +45,7 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
+		dispatch(&cfg, home)
 		b := bridge.New(cfg, nil, "slack", home)
 		b.Slack.Proxy = http.ProxyFromEnvironment
 		c, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -57,6 +58,11 @@ func main() {
 			fail(fmt.Errorf("the app-level token: %v", err))
 		}
 		fmt.Printf("slack.json reads, Socket Mode opens, and the bot token is %s in workspace %s.\n", user, team)
+		fmt.Printf("people (reach everything): %v\n", cfg.People)
+		fmt.Printf("side files read from %s\n", cfg.Dispatch)
+		for name, p := range b.Projects() {
+			fmt.Printf("project %s: channel %s, its own people %v\n", name, p.Channel, p.People)
+		}
 		return
 	case "", "serve":
 	case "help", "-h", "--help":
@@ -98,6 +104,7 @@ func main() {
 		}
 	}
 	os.Chmod(cfgPath, 0o600)
+	dispatch(&cfg, home)
 	b := bridge.New(cfg, h, name, home)
 	b.Slack.Proxy = http.ProxyFromEnvironment
 	b.Log = log.Printf
@@ -109,6 +116,18 @@ func main() {
 	if err := b.Run(ctx); err != nil && ctx.Err() == nil {
 		fail(err)
 	}
+}
+
+// dispatch points the side files at the workspace's projects/ folder, where
+// an exported project's <name>.dispatch.json sits beside its clone, unless
+// slack.json names another folder. HOME is <workspace>/.hive/modules/<name>.
+func dispatch(cfg *bridge.Config, home string) {
+	if cfg.Dispatch == "" {
+		cfg.Dispatch = filepath.Join(home, "..", "..", "..", "projects")
+	} else if !filepath.IsAbs(cfg.Dispatch) {
+		cfg.Dispatch = filepath.Join(home, cfg.Dispatch)
+	}
+	cfg.Dispatch = filepath.Clean(cfg.Dispatch)
 }
 
 func fail(err error) {
