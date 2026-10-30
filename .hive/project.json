@@ -1,3 +1,4 @@
 {
-  "test": "go test ./..."
+  "test": "go test ./...",
+  "forge_tests": ["test (ubuntu-latest)"]
 }
