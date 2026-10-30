@@ -53,7 +53,8 @@ It is an optional module, not one of the defaults.
   Slack continues the Hive's thread. Only what is posted after the module
   starts goes to Slack, not the history.
 - **State.** `state.json` beside slack.json holds the journal cursor, the
-  thread map and the runs it has seen, so a restart goes on where it stopped.
+  thread map, the runs it has seen and the outbox (lines not yet in Slack),
+  so a restart goes on where it stopped.
 
 ## Set it up (your steps)
 
@@ -116,6 +117,13 @@ Once Slack's Socket Mode says hello it reports kind `connected`, with
 refreshes, or one that drops and is back within a minute, is only logged; if
 Slack stays out of reach for a minute it reports `disconnected` (with the
 error) and, when it is back, `reconnected` (with `down_seconds`).
+
+A line Slack refuses is kept in the outbox and tried again (after a second,
+doubling to a minute), holding the lines after it so a thread stays in order.
+One Slack will never take (`channel_not_found`, `not_in_channel`,
+`is_archived`, `msg_too_long`…) or still refused after ten minutes is dropped
+and reported as kind `undelivered`, with `chat`, `thread`, `message`,
+`error`, `tries` and an `excerpt`, so the lead knows you didn't get it.
 
 ## Projects' channels and people
 
