@@ -131,9 +131,17 @@ type Bridge struct {
 	Home  string // where state.json is kept
 	Poll  time.Duration
 	Log   func(format string, a ...any)
+	// Retry is the first wait before opening a new Slack connection after
+	// one ends; it doubles on each failure, to two minutes.
+	Retry time.Duration
+	// ReportAfter is how long Slack may be out of reach before the Hive is
+	// told: a connection Slack refreshes, or one that drops and comes back
+	// a second later, is only logged.
+	ReportAfter time.Duration
 
 	st       State
 	me       string // the bot's Slack user id
+	team     string // the Slack workspace
 	misses   int
 	projects map[string]Project // slack.json's projects over the side files'
 	loaded   time.Time
@@ -143,7 +151,7 @@ type Bridge struct {
 
 // New sets a bridge up from its config and HOME, reading state.json.
 func New(cfg Config, h *hive.Client, name, home string) *Bridge {
-	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second}
+	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second, Retry: time.Second, ReportAfter: time.Minute}
 	b.Slack = &slack.Client{API: cfg.SlackAPI, AppToken: cfg.AppToken, BotToken: cfg.BotToken}
 	b.names = map[string]string{}
 	b.LoadProjects()
@@ -197,8 +205,8 @@ func (b *Bridge) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	b.me = me
-	b.logf("connected to Slack workspace %s as %s", team, me)
+	b.me, b.team = me, team
+	b.logf("Slack workspace %s, bot user %s", team, me)
 	b.LoadProjects()
 	if !b.st.Caught {
 		for {
@@ -223,35 +231,7 @@ func (b *Bridge) Start(ctx context.Context) error {
 // Run carries messages both ways until ctx ends or the Hive stops answering.
 func (b *Bridge) Run(ctx context.Context) error {
 	msgs := make(chan slack.Message, 64)
-	go func() {
-		wait := time.Second
-		for ctx.Err() == nil {
-			began := time.Now()
-			err := b.Slack.Listen(ctx, func(m slack.Message) {
-				select {
-				case msgs <- m:
-				case <-ctx.Done():
-				}
-			})
-			if ctx.Err() != nil {
-				return
-			}
-			if time.Since(began) > time.Minute {
-				wait = time.Second
-			}
-			if !errors.Is(err, slack.ErrDisconnect) {
-				b.logf("slack connection ended: %v; again in %s", err, wait)
-			}
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return
-			}
-			if wait < 2*time.Minute {
-				wait *= 2
-			}
-		}
-	}()
+	go b.listen(ctx, msgs)
 	tick := time.NewTicker(b.Poll)
 	defer tick.Stop()
 	for {
@@ -268,6 +248,80 @@ func (b *Bridge) Run(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+// listen keeps a Socket Mode connection open, opening a new one when one
+// ends, and tells the Hive (module.reported) when the first one is live,
+// when Slack has been out of reach for ReportAfter, and when it is back.
+func (b *Bridge) listen(ctx context.Context, msgs chan<- slack.Message) {
+	wait := b.Retry
+	first := true
+	var down time.Time // when the last live connection ended; zero while up
+	var lastErr error
+	toldDown := false
+	for ctx.Err() == nil {
+		began := time.Now()
+		live := false
+		err := b.Slack.Listen(ctx, func(m slack.Message) {
+			select {
+			case msgs <- m:
+			case <-ctx.Done():
+			}
+		}, func() {
+			live = true
+			switch {
+			case first:
+				first = false
+				b.report(ctx, "connected", fmt.Sprintf("connected to Slack workspace %s as %s", b.team, b.me), nil)
+			case toldDown:
+				out := time.Since(down).Round(time.Second)
+				b.report(ctx, "reconnected", fmt.Sprintf("reconnected to Slack workspace %s as %s after %s out of reach", b.team, b.me, out),
+					map[string]any{"down_seconds": int(out / time.Second)})
+			default:
+				b.logf("slack reconnected")
+			}
+			down, toldDown = time.Time{}, false
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if live {
+			down = time.Now()
+		} else if down.IsZero() {
+			down = began // the first connection never came up
+		}
+		lastErr = err
+		if time.Since(began) > time.Minute {
+			wait = b.Retry
+		}
+		if !errors.Is(err, slack.ErrDisconnect) {
+			b.logf("slack connection ended: %v; again in %s", err, wait)
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return
+		}
+		if !toldDown && time.Since(down) >= b.ReportAfter {
+			toldDown = true
+			b.report(ctx, "disconnected", fmt.Sprintf("Slack has been out of reach for %s: %v; still trying", time.Since(down).Round(time.Second), lastErr), nil)
+		}
+		if wait < 2*time.Minute {
+			wait *= 2
+		}
+	}
+}
+
+// report journals a module.reported line with the workspace and bot user.
+func (b *Bridge) report(ctx context.Context, kind, text string, extra map[string]any) {
+	b.logf("%s", text)
+	f := map[string]any{"kind": kind, "text": text, "workspace": b.team, "bot_user": b.me}
+	for k, v := range extra {
+		f[k] = v
+	}
+	if err := b.Hive.Report(ctx, f); err != nil {
+		b.logf("report %s: %v", kind, err)
 	}
 }
 

@@ -29,6 +29,7 @@ type fakeSlack struct {
 	conn  net.Conn
 	n     int
 	opens int
+	shut  bool // apps.connections.open refuses, as when Slack is out of reach
 }
 
 type slackPost struct{ Channel, Thread, Text, TS string }
@@ -52,7 +53,12 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		if auth(w, r, "xapp-app") {
 			f.mu.Lock()
 			f.opens++
+			shut := f.shut
 			f.mu.Unlock()
+			if shut {
+				json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "service_unavailable"})
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"ok": true, "url": "ws" + strings.TrimPrefix(f.srv.URL, "http") + "/socket?ticket=1"})
 		}
 	})
@@ -132,18 +138,26 @@ func (f *fakeSlack) Posts() []slackPost {
 
 // fakeHive is the daemon's API as a channel module sees it.
 type fakeHive struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	events []hive.Event
-	posts  []hive.Message
-	chats  map[string]bool
+	srv     *httptest.Server
+	mu      sync.Mutex
+	events  []hive.Event
+	posts   []hive.Message
+	chats   map[string]bool
+	reports []map[string]any
 }
 
 func newFakeHive(t *testing.T) *fakeHive {
 	h := &fakeHive{chats: map[string]bool{"lead": true, "project:hive": true}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) })
-	mux.HandleFunc("/api/module/report", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`"ok"`)) })
+	mux.HandleFunc("/api/module/report", func(w http.ResponseWriter, r *http.Request) {
+		var f map[string]any
+		json.NewDecoder(r.Body).Decode(&f)
+		h.mu.Lock()
+		h.reports = append(h.reports, f)
+		h.mu.Unlock()
+		w.Write([]byte(`"ok"`))
+	})
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			w.WriteHeader(401)
@@ -202,6 +216,12 @@ func (h *fakeHive) post(chat, thread, from, name, text string) hive.Message {
 	return m
 }
 
+func (h *fakeHive) Reports() []map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]map[string]any{}, h.reports...)
+}
+
 func (h *fakeHive) Posts() []hive.Message {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -226,7 +246,7 @@ type rig struct {
 	done   chan error
 }
 
-func start(t *testing.T, h *fakeHive, cfg Config) *rig {
+func start(t *testing.T, h *fakeHive, cfg Config, set ...func(*Bridge)) *rig {
 	t.Helper()
 	s := newFakeSlack(t)
 	if h == nil {
@@ -238,6 +258,9 @@ func start(t *testing.T, h *fakeHive, cfg Config) *rig {
 	}
 	b := New(cfg, &hive.Client{API: h.srv.URL, Token: "tok"}, "slack", t.TempDir())
 	b.Poll = 20 * time.Millisecond
+	for _, f := range set {
+		f(b)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := b.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -497,6 +520,54 @@ func TestRefusalSaid(t *testing.T) {
 	r.s.say(t, slack.Message{Channel: "CSEC", User: "UME", Text: "hi", TS: "1.1"})
 	if sp := r.slackPosts(t, 1)[0]; sp.Thread != "1.1" || !strings.Contains(sp.Text, "didn't take that: not found") {
 		t.Fatalf("Slack got %+v", sp)
+	}
+}
+
+// drop ends the live socket from Slack's side.
+func (f *fakeSlack) drop(t *testing.T) {
+	t.Helper()
+	waitFor(t, "a socket", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.conn != nil })
+	f.mu.Lock()
+	f.conn.Close()
+	f.conn = nil
+	f.mu.Unlock()
+}
+
+// The Hive hears when the module is live, with the workspace and bot user;
+// a connection that drops and comes straight back is not reported, one out
+// of reach for longer is, and so is its return.
+func TestReportsConnection(t *testing.T) {
+	r := start(t, nil, Config{}, func(b *Bridge) { b.Retry, b.ReportAfter = 10*time.Millisecond, 300*time.Millisecond })
+	waitFor(t, "a connected report", func() bool { return len(r.h.Reports()) >= 1 })
+	if c := r.h.Reports()[0]; c["kind"] != "connected" || c["workspace"] != "Lab" || c["bot_user"] != "UBOT" || !strings.Contains(c["text"].(string), "Lab") {
+		t.Fatalf("the first report is %v", c)
+	}
+
+	r.s.drop(t)
+	waitFor(t, "a new socket", func() bool { r.s.mu.Lock(); defer r.s.mu.Unlock(); return r.s.opens >= 2 && r.s.conn != nil })
+	time.Sleep(50 * time.Millisecond)
+	if got := r.h.Reports(); len(got) != 1 {
+		t.Fatalf("a quick reconnect was reported: %v", got[1:])
+	}
+
+	r.s.mu.Lock()
+	r.s.shut = true
+	r.s.mu.Unlock()
+	r.s.drop(t)
+	waitFor(t, "a disconnected report", func() bool { return len(r.h.Reports()) >= 2 })
+	if d := r.h.Reports()[1]; d["kind"] != "disconnected" || d["workspace"] != "Lab" || !strings.Contains(d["text"].(string), "service_unavailable") {
+		t.Fatalf("the outage was reported as %v", d)
+	}
+	r.s.mu.Lock()
+	r.s.shut = false
+	r.s.mu.Unlock()
+	waitFor(t, "a reconnected report", func() bool { return len(r.h.Reports()) >= 3 })
+	if c := r.h.Reports()[2]; c["kind"] != "reconnected" || c["bot_user"] != "UBOT" || len(r.h.Reports()) != 3 {
+		t.Fatalf("the return was reported as %v", r.h.Reports()[2:])
+	}
+	r.s.say(t, slack.Message{Channel: "D1", ChannelType: "im", User: "UME", Text: "back?", TS: "1.1"})
+	if p := r.hivePosts(t, 1)[0]; p.Text != "back?" {
+		t.Fatalf("after the outage the Hive got %+v", p)
 	}
 }
 
