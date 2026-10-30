@@ -20,7 +20,8 @@
         "channels:history", "groups:history", "im:history",
         "channels:read", "groups:read",
         "channels:manage", "groups:write", "channels:join",
-        "channels:write.topic", "groups:write.topic"
+        "channels:write.topic", "groups:write.topic",
+        "users:read"
       ]
     }
   },

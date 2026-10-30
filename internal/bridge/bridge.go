@@ -4,6 +4,9 @@
 // In: a message from one of the configured people in the lead's channel or a
 // DM with the app goes to the lead's chat; one in a project's channel goes to
 // that project's lead; "to <agent>: …" anywhere goes to that running agent.
+// A project's own people (slack.json's project entry, or the project's
+// <name>.dispatch.json side file) reach only that project's lead, only from
+// its channel, and the lead reads who wrote it.
 // The Hive posts it tagged with the module's name, so the lead reads it as
 // "Module slack: …". A Slack thread is one Hive thread: replies in it follow
 // it, and the Hive's answers in that thread come back as replies in it.
@@ -24,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -39,13 +43,32 @@ import (
 // HOME is .hive/modules/slack/, which every agent's view of the Hive has
 // covered, so no agent reads it.
 type Config struct {
-	AppToken string            `json:"app_token"`          // xapp-…, with connections:write
-	BotToken string            `json:"bot_token"`          // xoxb-…
-	People   []string          `json:"people"`             // Slack user ids whose messages are carried in; no one else's are
-	Lead     string            `json:"lead,omitempty"`     // channel id for the lead; a DM with the app reaches the lead too
-	Projects map[string]string `json:"projects,omitempty"` // project name -> channel id for its lead
-	Mirror   *bool             `json:"mirror"`             // post the Hive's own new threads to Slack; on unless false
-	SlackAPI string            `json:"slack_api,omitempty"`
+	AppToken string             `json:"app_token"` // xapp-…, with connections:write
+	BotToken string             `json:"bot_token"` // xoxb-…
+	People   []string           `json:"people"`    // Slack user ids whose messages are carried in; no one else's are
+	Lead     string             `json:"lead"`      // channel id for the lead; a DM with the app reaches the lead too
+	Projects map[string]Project `json:"projects"`  // project name -> its lead's channel, and who else may write there
+	Dispatch string             `json:"dispatch"`  // folder of <project>.dispatch.json side files; the workspace's projects/ by default
+	Mirror   *bool              `json:"mirror"`    // post the Hive's own new threads to Slack; on unless false
+	SlackAPI string             `json:"slack_api,omitempty"`
+}
+
+// Project is a project's Slack channel and the Slack users, besides the
+// global people, who may write to its lead there. In slack.json it is a
+// channel id ("C…") or {"channel": "C…", "people": ["U…"]}.
+type Project struct {
+	Channel string   `json:"channel"`
+	People  []string `json:"people,omitempty"`
+}
+
+func (p *Project) UnmarshalJSON(raw []byte) error {
+	var ch string
+	if json.Unmarshal(raw, &ch) == nil {
+		*p = Project{Channel: ch}
+		return nil
+	}
+	type plain Project
+	return json.Unmarshal(raw, (*plain)(p))
 }
 
 // LoadConfig reads and checks slack.json.
@@ -64,9 +87,6 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if !strings.HasPrefix(c.BotToken, "xoxb-") {
 		miss = append(miss, `bot_token (the bot token, "xoxb-…")`)
-	}
-	if len(c.People) == 0 {
-		miss = append(miss, `people (your Slack member id, "U…": only their messages reach the Hive)`)
 	}
 	if len(miss) > 0 {
 		return c, fmt.Errorf("%s needs %s", path, strings.Join(miss, ", "))
@@ -124,16 +144,22 @@ type Bridge struct {
 	// a second later, is only logged.
 	ReportAfter time.Duration
 
-	st     State
-	me     string // the bot's Slack user id
-	team   string // the Slack workspace
-	misses int
+	st       State
+	me       string // the bot's Slack user id
+	team     string // the Slack workspace
+	misses   int
+	projects map[string]Project // slack.json's projects over the side files'
+	loaded   time.Time
+	told     string
+	names    map[string]string // Slack user id -> the name the lead reads
 }
 
 // New sets a bridge up from its config and HOME, reading state.json.
 func New(cfg Config, h *hive.Client, name, home string) *Bridge {
 	b := &Bridge{Cfg: cfg, Hive: h, Name: name, Home: home, Poll: time.Second, Retry: time.Second, ReportAfter: time.Minute}
 	b.Slack = &slack.Client{API: cfg.SlackAPI, AppToken: cfg.AppToken, BotToken: cfg.BotToken}
+	b.names = map[string]string{}
+	b.LoadProjects()
 	raw, err := os.ReadFile(b.statePath())
 	if err == nil {
 		json.Unmarshal(raw, &b.st)
@@ -198,6 +224,7 @@ func (b *Bridge) Start(ctx context.Context) error {
 			b.Hive.Report(ctx, map[string]any{"kind": "waiting", "text": UpdateApp})
 		}
 	}
+	b.LoadProjects()
 	if !b.st.Caught {
 		for {
 			evs, err := b.Hive.Events(ctx, b.st.After)
@@ -231,6 +258,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		case m := <-msgs:
 			b.FromSlack(ctx, m)
 		case <-tick.C:
+			if time.Since(b.loaded) > 30*time.Second {
+				b.LoadProjects() // the export may have added or changed a side file
+			}
 			if err := b.PollHive(ctx); err != nil {
 				return err
 			}
@@ -407,8 +437,13 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 	if m.Subtype != "" || m.BotID != "" || m.User == "" || m.User == b.me {
 		return // edits, joins, bots and the app's own posts
 	}
+	// One of the global people steers everything; a project's own people
+	// reach that project's lead from its channel, and nothing else.
+	own := ""
 	if !b.person(m.User) {
-		return
+		if own = b.projectOf(m.User, m.Channel); own == "" {
+			return
+		}
 	}
 	id := key(m.Channel, m.TS)
 	for _, s := range b.st.Seen {
@@ -433,7 +468,20 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 		return
 	}
 	link, known := b.st.Threads[key(m.Channel, root)]
-	if !known {
+	if own != "" {
+		if known && link.Chat != "project:"+own {
+			b.reply(ctx, m.Channel, root, "This thread isn't with "+Escape(own)+"'s lead, so I didn't carry that in. Write in the channel to reach "+Escape(own)+"'s lead.")
+			return
+		}
+		if !known && strings.EqualFold(text, "help") {
+			b.reply(ctx, m.Channel, root, "Write here to reach "+Escape(own)+"'s lead in the Hive; its answer comes back in your thread. Reply in a thread to keep talking in it.")
+			return
+		}
+		if !known {
+			link = Link{Chat: "project:" + own}
+		}
+		text = b.signed(ctx, m.User, text)
+	} else if !known {
 		switch strings.ToLower(text) {
 		case "help":
 			b.reply(ctx, m.Channel, root, b.help())
@@ -475,12 +523,176 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 }
 
 func (b *Bridge) person(user string) bool {
-	for _, p := range b.Cfg.People {
-		if p == user {
-			return true
+	return slices.Contains(b.Cfg.People, user)
+}
+
+// projectOf is the project whose channel this is and whose own people
+// include user, or "".
+func (b *Bridge) projectOf(user, channel string) string {
+	for name, p := range b.projects {
+		if (p.Channel == channel || b.projectChannel(name) == channel) && slices.Contains(p.People, user) {
+			return name
 		}
 	}
-	return false
+	return ""
+}
+
+// signed names who wrote text for the lead, as Slack knows them.
+func (b *Bridge) signed(ctx context.Context, user, text string) string {
+	name, ok := b.names[user]
+	if !ok {
+		c, cancel := context.WithTimeout(ctx, 10*time.Second)
+		n, err := b.Slack.UserName(c, user)
+		cancel()
+		if err != nil {
+			b.logf("slack users.info %s: %v", user, err)
+		} else {
+			b.names[user] = n // a failure is asked again next time
+		}
+		name = n
+	}
+	if name == "" {
+		return "From Slack user " + user + ": " + text
+	}
+	return "From " + name + " (Slack " + user + "): " + text
+}
+
+// Projects is each project's channel and own people, as the bridge has them.
+func (b *Bridge) Projects() map[string]Project { return b.projects }
+
+// LoadProjects reads the side files in Cfg.Dispatch and lays slack.json's
+// projects over them: slack.json's channel wins, and the people of both may
+// write.
+func (b *Bridge) LoadProjects() {
+	b.loaded = time.Now()
+	ps := map[string]Project{}
+	var bad []string
+	if b.Cfg.Dispatch != "" {
+		ps, bad = ReadDispatch(b.Cfg.Dispatch)
+	}
+	for name, p := range b.Cfg.Projects {
+		q := ps[name]
+		if p.Channel != "" {
+			q.Channel = p.Channel
+		}
+		for _, u := range p.People {
+			if !slices.Contains(q.People, u) {
+				q.People = append(q.People, u)
+			}
+		}
+		ps[name] = q
+	}
+	for name, p := range ps {
+		if p.Channel == "" && len(p.People) == 0 {
+			delete(ps, name) // a project's people stay without a channel: the module may keep one for it
+		}
+	}
+	b.projects = ps
+	var names []string
+	for name, p := range ps {
+		names = append(names, fmt.Sprintf("%s=%s(%d)", name, p.Channel, len(p.People)))
+	}
+	sort.Strings(names)
+	sort.Strings(bad)
+	if msg := strings.Join(names, " ") + " " + strings.Join(bad, "; "); msg != b.told {
+		b.told = msg
+		b.logf("projects in Slack: %s", strings.Join(names, " "))
+		for _, s := range bad {
+			b.logf("side file skipped: %s", s)
+		}
+	}
+}
+
+// ReadDispatch reads <project>.dispatch.json in dir: each export's side file
+// names its project's Slack channel and the Slack users allowed in it. It
+// reads the fields one-hive's export may use: "channel" (or "channel_id",
+// "slack_channel", "slack_channel_id") and "allowed_users" (or "users",
+// "people", "slack_users", "slack_allowed_users"), at the top or under
+// "slack"; a user is an id ("U…") or an object with "id" (or "user_id",
+// "slack_id"). Symlinks and files over 1 MB are skipped, and so are files
+// that don't read; those come back in bad.
+func ReadDispatch(dir string) (map[string]Project, []string) {
+	ps := map[string]Project{}
+	var bad []string
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return ps, nil
+	}
+	for _, e := range ents {
+		name, ok := strings.CutSuffix(e.Name(), ".dispatch.json")
+		if !ok || name == "" || !e.Type().IsRegular() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.Size() > 1<<20 {
+			bad = append(bad, e.Name()+": over 1 MB")
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			bad = append(bad, e.Name()+": "+err.Error())
+			continue
+		}
+		p, err := parseDispatch(raw)
+		if err != nil {
+			bad = append(bad, e.Name()+": "+err.Error())
+			continue
+		}
+		if p.Channel == "" {
+			bad = append(bad, e.Name()+": no Slack channel")
+			continue
+		}
+		ps[name] = p
+	}
+	return ps, bad
+}
+
+func parseDispatch(raw []byte) (Project, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return Project{}, err
+	}
+	var p Project
+	look := func(m map[string]json.RawMessage) {
+		for _, k := range []string{"channel", "channel_id", "slack_channel", "slack_channel_id"} {
+			var ch string
+			if p.Channel == "" && json.Unmarshal(m[k], &ch) == nil {
+				p.Channel = strings.TrimSpace(ch)
+			}
+		}
+		for _, k := range []string{"allowed_users", "users", "people", "slack_users", "slack_allowed_users"} {
+			var us []json.RawMessage
+			if json.Unmarshal(m[k], &us) != nil {
+				continue
+			}
+			for _, u := range us {
+				if id := userID(u); id != "" && !slices.Contains(p.People, id) {
+					p.People = append(p.People, id)
+				}
+			}
+		}
+	}
+	var sub map[string]json.RawMessage
+	if json.Unmarshal(top["slack"], &sub) == nil {
+		look(sub)
+	}
+	look(top)
+	return p, nil
+}
+
+func userID(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var o map[string]any
+	json.Unmarshal(raw, &o)
+	for _, k := range []string{"id", "user_id", "slack_id"} {
+		if s, ok := o[k].(string); ok && s != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 var toRe = regexp.MustCompile(`(?is)^to\s+([^\s:]+)\s*:\s*(.+)$`)
@@ -501,8 +713,8 @@ func (b *Bridge) route(m slack.Message, text string) (string, string, error) {
 	if b.Cfg.Lead != "" && m.Channel == b.Cfg.Lead {
 		return "lead", text, nil
 	}
-	for p, ch := range b.Cfg.Projects {
-		if ch == m.Channel {
+	for p, pr := range b.projects {
+		if pr.Channel == m.Channel {
 			return "project:" + p, text, nil
 		}
 	}
@@ -519,7 +731,7 @@ func (b *Bridge) resolve(who string) (string, error) {
 	if p, ok := strings.CutPrefix(lw, "lead:"); ok {
 		lw = p
 	}
-	for p := range b.Cfg.Projects {
+	for p := range b.projects {
 		if strings.ToLower(p) == lw {
 			return "project:" + p, nil
 		}

@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -63,12 +64,13 @@ func (b *Bridge) leadChannel() string {
 	return b.Cfg.Lead
 }
 
-// projectChannel is the channel a project's lead is in.
+// projectChannel is the channel a project's lead is in: the managed one,
+// else the one slack.json or its side file names.
 func (b *Bridge) projectChannel(p string) string {
 	if name := b.holder(p); name != "" {
 		return b.st.Channels[name].ID
 	}
-	return b.Cfg.Projects[p]
+	return b.projects[p].Channel
 }
 
 // holder is the name of the managed channel holding chat, or "".
@@ -99,7 +101,7 @@ func (b *Bridge) known(p string) bool {
 	if b.st.Projects[p] || b.holder(p) != "" {
 		return true
 	}
-	_, ok := b.Cfg.Projects[p]
+	_, ok := b.projects[p]
 	return ok
 }
 
@@ -219,7 +221,7 @@ func (b *Bridge) cmdChannel(ctx context.Context, name string, holds []string) st
 		b.st.Channels[name] = c
 	}
 	var warn []string
-	for _, u := range b.Cfg.People {
+	for _, u := range b.invitees(name) {
 		if err := b.Slack.Invite(ctx, id, u); err != nil {
 			warn = append(warn, fmt.Sprintf("inviting <@%s>: %s", u, b.said(err)))
 		}
@@ -340,6 +342,20 @@ func (b *Bridge) unhold(chat string) string {
 	return name
 }
 
+// invitees are who a channel is for: the people, and the own users of the
+// projects it holds.
+func (b *Bridge) invitees(name string) []string {
+	us := append([]string{}, b.Cfg.People...)
+	for _, h := range b.st.Channels[name].Holds {
+		for _, u := range b.projects[h].People {
+			if !slices.Contains(us, u) {
+				us = append(us, u)
+			}
+		}
+	}
+	return us
+}
+
 // topic sets a managed channel's topic to who it reaches.
 func (b *Bridge) topic(ctx context.Context, name string) {
 	c, ok := b.st.Channels[name]
@@ -388,9 +404,9 @@ func (b *Bridge) channels() string {
 		lines = append(lines, fmt.Sprintf("<#%s> reaches the lead (slack.json)", b.Cfg.Lead))
 	}
 	var ps []string
-	for p, ch := range b.Cfg.Projects {
-		if b.holder(p) == "" {
-			ps = append(ps, fmt.Sprintf("<#%s> reaches %s's lead (slack.json)", ch, p))
+	for p, pr := range b.projects {
+		if b.holder(p) == "" && pr.Channel != "" {
+			ps = append(ps, fmt.Sprintf("<#%s> reaches %s's lead (slack.json or its side file)", pr.Channel, p))
 		}
 	}
 	sort.Strings(ps)

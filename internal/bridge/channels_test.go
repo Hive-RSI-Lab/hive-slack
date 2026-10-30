@@ -191,3 +191,24 @@ func TestOldAppTold(t *testing.T) {
 		t.Fatalf("missing %v", miss)
 	}
 }
+
+// A project's own Slack users (slack.json or its side file) are invited to
+// the channel the module keeps for the project, and reach its lead there.
+func TestProjectPeopleInManagedChannel(t *testing.T) {
+	h := newFakeHive(t)
+	h.chats["project:box"] = true
+	r := start(t, h, Config{Lead: "CLEAD", Projects: map[string]Project{"box": {People: []string{"UANN"}}}})
+	h.post("lead", "", "lead-lead-1", "lead", "slack: channel proj-box box")
+	r.said(t, 1)
+	box := r.saved(t).Channels["proj-box"]
+	r.s.mu.Lock()
+	invites := strings.Join(r.s.invites, " ")
+	r.s.mu.Unlock()
+	if invites != box.ID+"/UME "+box.ID+"/UANN" {
+		t.Fatalf("invited %q", invites)
+	}
+	r.s.say(t, slack.Message{Channel: box.ID, User: "UANN", Text: "is the build green?", TS: "1.1"})
+	if p := r.hivePosts(t, 2)[1]; p.Chat != "project:box" || p.Text != "From Ann Lee (Slack UANN): is the build green?" {
+		t.Fatalf("the Hive got %+v", p)
+	}
+}

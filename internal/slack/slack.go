@@ -160,6 +160,30 @@ func (c *Client) Post(ctx context.Context, channel, threadTS, text string) (stri
 	return out.TS, err
 }
 
+// UserName is how Slack names a user (users.info, which needs the users:read
+// scope): their display name, else their real name, else their handle.
+func (c *Client) UserName(ctx context.Context, user string) (string, error) {
+	var out struct {
+		User struct {
+			Name     string `json:"name"`
+			RealName string `json:"real_name"`
+			Profile  struct {
+				DisplayName string `json:"display_name"`
+				RealName    string `json:"real_name"`
+			} `json:"profile"`
+		} `json:"user"`
+	}
+	if err := c.call(ctx, c.BotToken, "users.info?user="+url.QueryEscape(user), map[string]string{}, &out); err != nil {
+		return "", err
+	}
+	for _, n := range []string{out.User.Profile.DisplayName, out.User.Profile.RealName, out.User.RealName, out.User.Name} {
+		if n = strings.TrimSpace(n); n != "" {
+			return n, nil
+		}
+	}
+	return "", nil
+}
+
 // Open asks for a Socket Mode address with the app-level token.
 func (c *Client) Open(ctx context.Context) (string, error) {
 	var open struct {
