@@ -315,22 +315,26 @@ func newFakeHive(t *testing.T) *fakeHive {
 }
 
 func (h *fakeHive) add(kind string, data any) {
-	raw, _ := json.Marshal(data)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.addLocked(kind, data)
+}
+
+func (h *fakeHive) addLocked(kind string, data any) {
+	raw, _ := json.Marshal(data)
 	h.events = append(h.events, hive.Event{Seq: int64(len(h.events) + 1), Kind: kind, Data: raw})
 }
 
 // post is a line in a chat, journaled as chat.posted.
 func (h *fakeHive) post(chat, thread, from, name, text string) hive.Message {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	id := fmt.Sprintf("m%d", len(h.events)+1)
-	h.mu.Unlock()
 	if thread == "" {
 		thread = id
 	}
 	m := hive.Message{ID: id, Chat: chat, Thread: thread, From: from, Name: name, Text: text}
-	h.add("chat.posted", m)
+	h.addLocked("chat.posted", m)
 	return m
 }
 
@@ -591,9 +595,8 @@ func TestReachAnAgent(t *testing.T) {
 	if q := r.hivePosts(t, 2)[1]; q.Chat != p.Chat {
 		t.Fatalf("the reply went to %+v", q)
 	}
+	// No wait for the module to poll: it reads the journal before routing.
 	h.add("run.status", map[string]string{"id": "w-261028-1-abcdef1234", "status": "done"})
-	h.post("lead", "", "lead-lead-1", "lead", "after the end")
-	r.slackPosts(t, 4) // the module has read the end, which came before this
 	r.s.say(t, slack.Message{Channel: "CLEAD", User: "UME", Text: "still there?", TS: "1.5", ThreadTS: "1.3"})
 	if q := r.hivePosts(t, 3)[2]; q.Chat != "lead" {
 		t.Fatalf("a thread with an ended agent still went to %+v", q)

@@ -276,6 +276,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case m := <-msgs:
+			// Read the journal up to now first, so what the Hive did before
+			// this message (an agent's end, a new run) routes it: a reply in
+			// an ended agent's thread goes to the lead, not a chat no one reads.
+			if err := b.PollHive(ctx); err != nil {
+				return err
+			}
 			b.FromSlack(ctx, m)
 		case <-tick.C:
 			if time.Since(b.loaded) > 30*time.Second {
