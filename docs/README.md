@@ -135,6 +135,11 @@ The Slack app and its tokens are yours. The Hive never makes them.
 
 The program waits until slack.json exists, and reports once (`module.reported`,
 kind `waiting`) what is missing, so it can be installed before the app is made.
+Once Slack's Socket Mode says hello it reports kind `connected`, with
+`workspace` and `bot_user`, so the Hive sees it is live. A connection Slack
+refreshes, or one that drops and is back within a minute, is only logged; if
+Slack stays out of reach for a minute it reports `disconnected` (with the
+error) and, when it is back, `reconnected` (with `down_seconds`).
 
 ## What it holds, and who can read it
 

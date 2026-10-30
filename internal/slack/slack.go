@@ -175,8 +175,9 @@ var ErrDisconnect = errors.New("slack: socket mode disconnect")
 
 // Listen opens one Socket Mode connection and hands each message event to
 // handle until the connection ends; every envelope is acknowledged first,
-// as Slack retries one it doesn't hear back about within 3 seconds.
-func (c *Client) Listen(ctx context.Context, handle func(Message)) error {
+// as Slack retries one it doesn't hear back about within 3 seconds. opened
+// (if not nil) is called when Slack's hello says the connection is live.
+func (c *Client) Listen(ctx context.Context, handle func(Message), opened func()) error {
 	u, err := c.Open(ctx)
 	if err != nil {
 		return err
@@ -186,6 +187,10 @@ func (c *Client) Listen(ctx context.Context, handle func(Message)) error {
 		return err
 	}
 	defer conn.Close()
+	// Slack's pings and our pings' pongs arrive well within this; it is
+	// counted from the last frame of any kind, not the last message, as an
+	// idle workspace sends no messages for hours.
+	conn.Idle = 2 * time.Minute
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -204,8 +209,6 @@ func (c *Client) Listen(ctx context.Context, handle func(Message)) error {
 		}
 	}()
 	for {
-		// Slack pings and our pings' pongs arrive well within this.
-		conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		raw, err := conn.Read()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -232,6 +235,10 @@ func (c *Client) Listen(ctx context.Context, handle func(Message)) error {
 			}
 		}
 		switch env.Type {
+		case "hello":
+			if opened != nil {
+				opened()
+			}
 		case "disconnect":
 			return fmt.Errorf("%w (%s)", ErrDisconnect, env.Reason)
 		case "events_api":
