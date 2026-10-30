@@ -102,7 +102,7 @@ func (c *Client) call(ctx context.Context, token, method string, body, out any) 
 		return fmt.Errorf("slack %s: %s: %v", method, resp.Status, err)
 	}
 	if !res.OK {
-		return &Error{Method: method, Code: res.Error, Needed: res.Needed}
+		return &APIError{Method: method, Code: res.Error, Needed: res.Needed}
 	}
 	if out != nil {
 		return json.Unmarshal(buf.Bytes(), out)
@@ -110,20 +110,20 @@ func (c *Client) call(ctx context.Context, token, method string, body, out any) 
 	return nil
 }
 
-// Error is a Web API method's refusal: Code is Slack's error string
-// ("missing_scope", "name_taken", …) and Needed the scope it lacked.
-type Error struct{ Method, Code, Needed string }
+// APIError is Slack's {"ok": false, "error": code}: Code is Slack's error
+// string ("missing_scope", "name_taken", …) and Needed the scope it lacked.
+type APIError struct{ Method, Code, Needed string }
 
-func (e *Error) Error() string {
+func (e *APIError) Error() string {
 	if e.Needed != "" {
-		return fmt.Sprintf("slack %s: %s (needs %s)", e.Method, e.Code, e.Needed)
+		return "slack " + e.Method + ": " + e.Code + " (needs " + e.Needed + ")"
 	}
-	return fmt.Sprintf("slack %s: %s", e.Method, e.Code)
+	return "slack " + e.Method + ": " + e.Code
 }
 
 // Code is Slack's error string for err, or "" when it isn't Slack's refusal.
 func Code(err error) string {
-	var e *Error
+	var e *APIError
 	if errors.As(err, &e) {
 		return e.Code
 	}
