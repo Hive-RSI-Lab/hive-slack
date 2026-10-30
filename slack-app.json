@@ -15,7 +15,7 @@
   },
   "oauth_config": {
     "scopes": {
-      "bot": ["chat:write", "channels:history", "groups:history", "im:history"]
+      "bot": ["chat:write", "channels:history", "groups:history", "im:history", "users:read"]
     }
   },
   "settings": {

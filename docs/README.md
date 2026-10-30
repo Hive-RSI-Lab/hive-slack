@@ -23,8 +23,8 @@ It is an optional module, not one of the defaults.
  answer, in the same thread  ◀──────  chat.postMessage (bot token)
 ```
 
-- **In.** A message from you (and only you: slack.json lists the Slack member
-  ids it carries in) goes to:
+- **In.** A message from one of the global `people` (slack.json lists their
+  Slack member ids) goes to:
   - the **lead** when it's a DM with the app or in the `lead` channel;
   - a **project's lead** when it's in that project's channel, or starts
     `to <project>: …`;
@@ -33,6 +33,16 @@ It is an optional module, not one of the defaults.
     `agents` lists who is running.
   A reply in a Slack thread goes on in the same Hive thread, whatever it says.
   `help` says all of this in Slack.
+- **A project's own people.** Each project can also name Slack users of its
+  own, who may write in that project's channel (see
+  [Projects' channels and people](#projects-channels-and-people)). A message
+  from one of them in that channel goes to that project's lead, and only
+  there: `to …:` and `agents` are passed to the lead as they are, a DM or
+  another channel is dropped, and a reply in a thread that isn't with that
+  project's lead gets a one-line refusal. The lead reads who wrote it:
+  `From Ann Lee (Slack U…): …` (the name is from Slack's `users.info`; without
+  the `users:read` scope it is `From Slack user U…: …`). The lead's answer comes
+  back in the same Slack thread.
 - **Out.** The module reads the journal's `chat.posted` lines. An answer in a
   thread that started in Slack is posted in that Slack thread. When `mirror` is
   on (the default), something the Hive starts itself is posted as a new message
@@ -56,7 +66,9 @@ The Slack app and its tokens are yours. The Hive never makes them.
    for these bot scopes:
    - `chat:write`: post the answers;
    - `channels:history`, `groups:history`, `im:history`: read the messages in
-     the channels you invite it to and your DM with it.
+     the channels you invite it to and your DM with it;
+   - `users:read`: name who wrote a project user's message for the lead
+     (optional: without it the lead reads the Slack id).
    It subscribes to the `message.channels`, `message.groups` and `message.im`
    events.
 2. **Install it.** Under **Install App**, click **Install to Workspace**, then
@@ -79,12 +91,13 @@ The Slack app and its tokens are yours. The Hive never makes them.
      "bot_token": "xoxb-…",
      "people": ["U…"],
      "lead": "C…",
-     "projects": {"hive": "C…", "hive-hwde": "C…"},
+     "projects": {"hive": "C…", "box": {"channel": "C…", "people": ["U…"]}},
      "mirror": true
    }
    ```
 
-   Only `app_token`, `bot_token` and `people` are needed. Then run
+   Only `app_token` and `bot_token` are needed, but no one reaches the Hive
+   until `people` or a project names someone. Then run
    `chmod 600` on it (the module sets that mode too when it starts).
 7. **Check it.** `hive slack check` reads slack.json, opens a Socket Mode
    connection with the app token and asks Slack who the bot token is.
@@ -93,6 +106,9 @@ The Slack app and its tokens are yours. The Hive never makes them.
    reaches it. A grant of some projects reaches only those projects' leads and
    agents.
 
+`hive slack check` also lists each project's channel and its own people, as
+the program reads them from slack.json and the side files.
+
 The program waits until slack.json exists, and reports once (`module.reported`,
 kind `waiting`) what is missing, so it can be installed before the app is made.
 Once Slack's Socket Mode says hello it reports kind `connected`, with
@@ -100,6 +116,39 @@ Once Slack's Socket Mode says hello it reports kind `connected`, with
 refreshes, or one that drops and is back within a minute, is only logged; if
 Slack stays out of reach for a minute it reports `disconnected` (with the
 error) and, when it is back, `reconnected` (with `down_seconds`).
+
+## Projects' channels and people
+
+A project's Slack channel and the users allowed in it come from either place,
+per project:
+
+- **slack.json's `projects`.** `"name": "C…"` is just the channel (only the
+  global `people` write there); `"name": {"channel": "C…", "people": ["U…"]}`
+  lets those users write there too.
+- **The project's side file**, `<name>.dispatch.json`, as one-hive's export
+  writes it. The program reads every `*.dispatch.json` in the `dispatch`
+  folder. That folder is the workspace's `projects/` by default, where an
+  exported project's side file sits beside its clone (`projects/<name>/`). It
+  is `<HOME>/../../../projects`, as the module's HOME is
+  `<workspace>/.hive/modules/slack`. Set `"dispatch": "/some/folder"` in
+  slack.json to read them elsewhere (a relative path is from HOME). The file
+  is read again every 30 seconds, so a new or changed export takes effect
+  without a restart. The program reads the channel from `channel`,
+  `channel_id`, `slack_channel` or `slack_channel_id`, and the users from
+  `allowed_users`, `users`, `people`, `slack_users` or `slack_allowed_users`,
+  either at the top of the file or under `"slack"`. A user is a member id
+  (`"U…"`) or an object with `id`, `user_id` or `slack_id`. For example:
+
+  ```json
+  {"slack": {"channel": "C0123", "allowed_users": ["U0456", "U0789"]}}
+  ```
+
+  A side file with no channel, one that doesn't parse, a symlink or a file
+  over 1 MB is skipped, and the module's log says so. Channels must be ids
+  (`C…`/`G…`), not names.
+
+When both name a project, slack.json's channel wins and the people of both may
+write. The global `people` reach every project's channel, as before.
 
 ## What it holds, and who can read it
 
@@ -112,8 +161,12 @@ error) and, when it is back, `reconnected` (with `down_seconds`).
   review is what vouches for it.
 - **No port opens.** Socket Mode is a WebSocket the module dials out to
   Slack (through `HTTPS_PROXY` if one is set). Slack never connects in.
-- **Only you steer.** A message from anyone not in `people` is dropped, and so
-  are bots' posts, edits and the app's own posts. Everyone in a channel you
+- **Only the people named steer.** A message from anyone not in `people` is
+  dropped, unless they are one of a project's own people writing in that
+  project's channel, and then it reaches only that project's lead, signed with
+  who they are. Bots' posts, edits and the app's own posts are dropped too.
+  A side file grants Slack users a project lead's ear, so the `dispatch`
+  folder should be one only you and the export write to. Everyone in a channel you
   invite the app to can read the Hive's answers there, so use a private
   channel or the DM for anything private.
 - **Its reach in the Hive** is the `channel` hook: `/api/chat`,
@@ -131,5 +184,6 @@ error) and, when it is back, `reconnected` (with `down_seconds`).
 
 `go test ./...` runs against a fake Slack (its Web API and a Socket Mode
 WebSocket on localhost) and a fake Hive API. The tests cover DMs to the lead
-and back, threads, project leads, reaching an agent, mirroring, who is let in,
-refusals, restarts, and the WebSocket framing.
+and back, threads, project leads, a project's own people (from side files and
+slack.json), reaching an agent, mirroring, who is let in, refusals, restarts,
+reading side files, and the WebSocket framing.

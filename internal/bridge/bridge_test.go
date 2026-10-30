@@ -75,6 +75,16 @@ func newFakeSlack(t *testing.T) *fakeSlack {
 		f.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": ts})
 	})
+	mux.HandleFunc("/api/users.info", func(w http.ResponseWriter, r *http.Request) {
+		if !auth(w, r, "xoxb-bot") {
+			return
+		}
+		if r.URL.Query().Get("user") != "UANN" {
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "missing_scope"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": map[string]any{"name": "ann", "profile": map[string]string{"display_name": "Ann Lee"}}})
+	})
 	mux.HandleFunc("/socket", func(w http.ResponseWriter, r *http.Request) {
 		conn, rw, _ := w.(http.Hijacker).Hijack()
 		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws.Accept(r.Header.Get("Sec-Websocket-Key")) + "\r\n\r\n")
@@ -128,9 +138,9 @@ func (f *fakeSlack) Posts() []slackPost {
 
 // fakeHive is the daemon's API as a channel module sees it.
 type fakeHive struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	events []hive.Event
+	srv     *httptest.Server
+	mu      sync.Mutex
+	events  []hive.Event
 	posts   []hive.Message
 	chats   map[string]bool
 	reports []map[string]any
@@ -320,10 +330,103 @@ func TestOnlyThePerson(t *testing.T) {
 	}
 }
 
+// A project's own people, from its side file, reach that project's lead from
+// its channel, named, and its answer comes back in their thread; they reach
+// nothing else, and people allowed for no project are still dropped.
+func TestProjectPeople(t *testing.T) {
+	h := newFakeHive(t)
+	h.chats["project:box"] = true
+	h.add("run.created", map[string]string{"id": "w-261028-1-abcdef1234", "role": "worker", "project": "box"})
+	dir := t.TempDir()
+	writeFile(t, dir+"/box.dispatch.json", `{"project":"box","slack":{"channel":"CBOX","allowed_users":["UANN","UBEN"]}}`)
+	r := start(t, h, Config{Lead: "CLEAD", Dispatch: dir})
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "UANN", Text: "<@UBOT> is the build green?", TS: "1.1"})
+	p := r.hivePosts(t, 1)[0]
+	if p.Chat != "project:box" || p.Text != "From Ann Lee (Slack UANN): is the build green?" {
+		t.Fatalf("the Hive got %+v", p)
+	}
+	h.post("project:box", p.Thread, "lead-project-box-1", "lead:box", "Yes.")
+	if sp := r.slackPosts(t, 1)[0]; sp.Channel != "CBOX" || sp.Thread != "1.1" || sp.Text != "*lead:box*: Yes." {
+		t.Fatalf("Slack got %+v", sp)
+	}
+	// Ann's reply follows the thread; Ben, whose name Slack won't give, is named by id.
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "UANN", Text: "thanks", TS: "1.2", ThreadTS: "1.1"})
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "UBEN", Text: "to abcdef: stop", TS: "1.3"})
+	ps := r.hivePosts(t, 3)
+	if ps[1].Chat != "project:box" || ps[1].Thread != p.Thread || ps[1].Text != "From Ann Lee (Slack UANN): thanks" {
+		t.Fatalf("Ann's reply went in as %+v", ps[1])
+	}
+	if ps[2].Chat != "project:box" || ps[2].Text != "From Slack user UBEN: to abcdef: stop" {
+		t.Fatalf("Ben's message went in as %+v", ps[2])
+	}
+	// Not their channel, not someone allowed, not their thread: dropped.
+	r.s.say(t, slack.Message{Channel: "CLEAD", User: "UANN", Text: "lead?", TS: "1.4"})
+	r.s.say(t, slack.Message{Channel: "D9", ChannelType: "im", User: "UANN", Text: "dm", TS: "1.5"})
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "USTRANGER", Text: "merge it", TS: "1.6"})
+	// The person still reaches everything, unnamed, from the project's channel too.
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "UME", Text: "to abcdef: how far?", TS: "1.7"})
+	ps = r.hivePosts(t, 4)
+	if ps[3].Chat != "agent:w-261028-1-abcdef1234" || ps[3].Text != "how far?" {
+		t.Fatalf("the person's message went in as %+v", ps[3])
+	}
+	r.s.say(t, slack.Message{Channel: "CBOX", User: "UANN", Text: "me too", TS: "1.8", ThreadTS: "1.7"})
+	if sp := r.slackPosts(t, 2)[1]; sp.Thread != "1.7" || !strings.Contains(sp.Text, "isn't with box's lead") {
+		t.Fatalf("Slack got %+v", sp)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := r.h.Posts(); len(got) != 4 {
+		t.Fatalf("dropped messages reached the Hive: %+v", got[4:])
+	}
+}
+
+// slack.json's projects give a project's people too, and its channel wins
+// over the side file's; a side file the export changes is read again.
+func TestProjectsFromSlackJSON(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir+"/box.dispatch.json", `{"slack_channel":"COLD","allowed_users":[{"id":"UANN","name":"Ann"}]}`)
+	writeFile(t, dir+"/nochan.dispatch.json", `{"allowed_users":["UX"]}`)
+	writeFile(t, dir+"/broken.dispatch.json", `{`)
+	b := New(Config{People: []string{"UME"}, Dispatch: dir, Projects: map[string]Project{"box": {Channel: "CBOX", People: []string{"UCAL"}}, "deck": {Channel: "CDECK"}}}, nil, "slack", t.TempDir())
+	ps := b.Projects()
+	if len(ps) != 2 || ps["box"].Channel != "CBOX" || strings.Join(ps["box"].People, ",") != "UANN,UCAL" || ps["deck"].Channel != "CDECK" {
+		t.Fatalf("projects are %+v", ps)
+	}
+	if b.projectOf("UCAL", "CBOX") != "box" || b.projectOf("UANN", "COLD") != "" || b.projectOf("UANN", "CDECK") != "" {
+		t.Fatal("a project's people reach the wrong channel")
+	}
+	writeFile(t, dir+"/new.dispatch.json", `{"channel_id":"CNEW","users":["UNEW"]}`)
+	b.LoadProjects()
+	if b.projectOf("UNEW", "CNEW") != "new" {
+		t.Fatalf("a new side file isn't read: %+v", b.Projects())
+	}
+}
+
+func TestReadDispatch(t *testing.T) {
+	for in, want := range map[string]Project{
+		`{"slack":{"channel":"C1","allowed_users":["U1","U2"]}}`:              {Channel: "C1", People: []string{"U1", "U2"}},
+		`{"slack_channel":"C1","slack_users":[{"user_id":"U1"},{"x":1}]}`:     {Channel: "C1", People: []string{"U1"}},
+		`{"slack":{"channel_id":" C1 "},"people":["U1"],"channel":"C2"}`:      {Channel: "C1", People: []string{"U1"}},
+		`{"id":"box","slack":{"slack_channel_id":"C1","people":["U1","U1"]}}`: {Channel: "C1", People: []string{"U1"}},
+	} {
+		got, err := parseDispatch([]byte(in))
+		if err != nil || got.Channel != want.Channel || strings.Join(got.People, ",") != strings.Join(want.People, ",") {
+			t.Errorf("parseDispatch(%s) = %+v, %v; want %+v", in, got, err, want)
+		}
+	}
+	dir := t.TempDir()
+	writeFile(t, dir+"/real.dispatch.json", `{"channel":"C1"}`)
+	os.Symlink(dir+"/real.dispatch.json", dir+"/link.dispatch.json")
+	writeFile(t, dir+"/other.json", `{"channel":"C2"}`)
+	ps, bad := ReadDispatch(dir)
+	if len(ps) != 1 || ps["real"].Channel != "C1" || len(bad) != 0 {
+		t.Fatalf("ReadDispatch = %+v, %v", ps, bad)
+	}
+}
+
 // A project's channel reaches that project's lead; "to <project>: …" does
 // from anywhere.
 func TestProjectLead(t *testing.T) {
-	r := start(t, nil, Config{Projects: map[string]string{"hive": "CHIVE"}})
+	r := start(t, nil, Config{Projects: map[string]Project{"hive": {Channel: "CHIVE"}}})
 	r.s.say(t, slack.Message{Channel: "CHIVE", User: "UME", Text: "status?", TS: "1.1"})
 	r.s.say(t, slack.Message{Channel: "D1", ChannelType: "im", User: "UME", Text: "to hive: and this", TS: "1.2"})
 	p := r.hivePosts(t, 2)
@@ -413,7 +516,7 @@ func TestMirror(t *testing.T) {
 // A Hive that refuses the post (a chat the module isn't granted) says so in
 // the Slack thread.
 func TestRefusalSaid(t *testing.T) {
-	r := start(t, nil, Config{Projects: map[string]string{"secret": "CSEC"}})
+	r := start(t, nil, Config{Projects: map[string]Project{"secret": {Channel: "CSEC"}}})
 	r.s.say(t, slack.Message{Channel: "CSEC", User: "UME", Text: "hi", TS: "1.1"})
 	if sp := r.slackPosts(t, 1)[0]; sp.Thread != "1.1" || !strings.Contains(sp.Text, "didn't take that: not found") {
 		t.Fatalf("Slack got %+v", sp)
@@ -501,12 +604,17 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal("no file loaded")
 	}
 	writeFile(t, path, `{"app_token":"xoxb-wrong","bot_token":"xoxb-1"}`)
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "app_token") || !strings.Contains(err.Error(), "people") {
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "app_token") {
 		t.Fatalf("a bad config read as %v", err)
 	}
 	writeFile(t, path, `{"app_token":"xapp-1","bot_token":"xoxb-1","people":["U1"]}`)
 	if c, err := LoadConfig(path); err != nil || !c.mirror() {
 		t.Fatalf("a good config read as %v", err)
+	}
+	writeFile(t, path, `{"app_token":"xapp-1","bot_token":"xoxb-1","projects":{"a":"CA","b":{"channel":"CB","people":["UB"]}}}`)
+	c, err := LoadConfig(path)
+	if err != nil || c.Projects["a"].Channel != "CA" || c.Projects["b"].Channel != "CB" || len(c.Projects["b"].People) != 1 {
+		t.Fatalf("projects read as %+v, %v", c.Projects, err)
 	}
 }
 
