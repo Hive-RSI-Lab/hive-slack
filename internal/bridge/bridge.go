@@ -38,9 +38,11 @@ import (
 	"github.com/Hive-RSI-Lab/hive-slack/internal/slack"
 )
 
-// Config is slack.json in the module's HOME: the person's tokens and which
-// channel reaches which chat. HOME is .hive/modules/slack/, which every
-// agent's view of the Hive has covered, so no agent reads it.
+// Config is slack.json in the module's HOME: the person's tokens and who
+// they are. The channels are the module's own (channels.go); lead and
+// projects here still name channels made by hand, for an app from before.
+// HOME is .hive/modules/slack/, which every agent's view of the Hive has
+// covered, so no agent reads it.
 type Config struct {
 	AppToken string             `json:"app_token"` // xapp-…, with connections:write
 	BotToken string             `json:"bot_token"` // xoxb-…
@@ -122,6 +124,9 @@ type State struct {
 	Runs    map[string]Run    `json:"runs"`
 	Seen    []string          `json:"seen"` // Slack messages already carried in, newest last
 	Outbox  []Pending         `json:"outbox,omitempty"`
+	// Channels are the channels the module manages, by name.
+	Channels map[string]Channel `json:"channels"`
+	Projects map[string]bool    `json:"projects"` // the projects the journal has named
 }
 
 // Pending is a chat line read from the journal and not yet in Slack. The
@@ -196,6 +201,12 @@ func (b *Bridge) init() {
 	if b.st.Runs == nil {
 		b.st.Runs = map[string]Run{}
 	}
+	if b.st.Channels == nil {
+		b.st.Channels = map[string]Channel{}
+	}
+	if b.st.Projects == nil {
+		b.st.Projects = map[string]bool{}
+	}
 }
 
 func (b *Bridge) statePath() string { return filepath.Join(b.Home, "state.json") }
@@ -227,6 +238,12 @@ func (b *Bridge) Start(ctx context.Context) error {
 	}
 	b.me, b.team = me, team
 	b.logf("Slack workspace %s, bot user %s", team, me)
+	if miss := b.missingScopes(); len(miss) > 0 {
+		b.logf("the bot token lacks %s", strings.Join(miss, ", "))
+		if b.Hive != nil {
+			b.Hive.Report(ctx, map[string]any{"kind": "waiting", "text": UpdateApp})
+		}
+	}
 	b.LoadProjects()
 	if !b.st.Caught {
 		for {
@@ -363,8 +380,13 @@ func (b *Bridge) PollHive(ctx context.Context) error {
 	b.misses = 0
 	for _, e := range evs {
 		b.track(e)
-		if e.Kind == "chat.posted" {
-			b.fromHive(e)
+		switch e.Kind {
+		case "chat.posted":
+			b.fromHive(ctx, e)
+		case "project.removed":
+			var d struct{ Name string }
+			json.Unmarshal(e.Data, &d)
+			b.retire(ctx, d.Name)
 		}
 		b.st.After = e.Seq
 	}
@@ -464,6 +486,16 @@ func (b *Bridge) track(e hive.Event) {
 		ID, Role, Name, Project, Status string
 	}
 	switch e.Kind {
+	case "project.created", "project.updated":
+		var p struct{ Name string }
+		json.Unmarshal(e.Data, &p)
+		if p.Name != "" {
+			b.st.Projects[p.Name] = true
+		}
+	case "project.removed":
+		var p struct{ Name string }
+		json.Unmarshal(e.Data, &p)
+		delete(b.st.Projects, p.Name)
 	case "run.created":
 		json.Unmarshal(e.Data, &d)
 		if d.ID != "" {
@@ -565,6 +597,13 @@ func (b *Bridge) FromSlack(ctx context.Context, m slack.Message) {
 		case "agents":
 			b.reply(ctx, m.Channel, root, b.agents())
 			return
+		case "channels":
+			b.reply(ctx, m.Channel, root, b.channels())
+			return
+		}
+		if line, ok := Command(text); ok {
+			b.reply(ctx, m.Channel, root, b.command(ctx, line))
+			return
 		}
 		chat, rest, err := b.route(m, text)
 		if err != nil {
@@ -599,7 +638,7 @@ func (b *Bridge) person(user string) bool {
 // include user, or "".
 func (b *Bridge) projectOf(user, channel string) string {
 	for name, p := range b.projects {
-		if p.Channel == channel && slices.Contains(p.People, user) {
+		if (p.Channel == channel || b.projectChannel(name) == channel) && slices.Contains(p.People, user) {
 			return name
 		}
 	}
@@ -652,8 +691,8 @@ func (b *Bridge) LoadProjects() {
 		ps[name] = q
 	}
 	for name, p := range ps {
-		if p.Channel == "" {
-			delete(ps, name)
+		if p.Channel == "" && len(p.People) == 0 {
+			delete(ps, name) // a project's people stay without a channel: the module may keep one for it
 		}
 	}
 	b.projects = ps
@@ -772,7 +811,14 @@ func (b *Bridge) route(m slack.Message, text string) (string, string, error) {
 		chat, err := b.resolve(g[1])
 		return chat, strings.TrimSpace(g[2]), err
 	}
-	if m.ChannelType == "im" || (b.Cfg.Lead != "" && m.Channel == b.Cfg.Lead) {
+	if m.ChannelType == "im" {
+		return "lead", text, nil
+	}
+	if name, c, ok := b.byID(m.Channel); ok {
+		chat, rest := b.routeManaged(name, c, text)
+		return chat, rest, nil
+	}
+	if b.Cfg.Lead != "" && m.Channel == b.Cfg.Lead {
 		return "lead", text, nil
 	}
 	for p, pr := range b.projects {
@@ -798,6 +844,9 @@ func (b *Bridge) resolve(who string) (string, error) {
 			return "project:" + p, nil
 		}
 	}
+	if lw != LeadChat && b.known(lw) {
+		return "project:" + lw, nil
+	}
 	var hits []string
 	for _, r := range b.st.Runs {
 		if r.ID == who || strings.EqualFold(r.Name, who) {
@@ -818,20 +867,8 @@ func (b *Bridge) resolve(who string) (string, error) {
 }
 
 func (b *Bridge) help() string {
-	lead := "a DM with me"
-	if b.Cfg.Lead != "" {
-		lead += " or <#" + b.Cfg.Lead + ">"
-	}
-	var ps []string
-	for p, pr := range b.projects {
-		ps = append(ps, fmt.Sprintf("<#%s> reaches %s's lead", pr.Channel, p))
-	}
-	sort.Strings(ps)
-	s := "Write in " + lead + " to reach the Hive's lead."
-	if len(ps) > 0 {
-		s += " " + strings.Join(ps, "; ") + "."
-	}
-	return s + "\n`to <agent>: …` reaches a running agent (its id, the end of its id, or its name); `to <project>: …` a project's lead. `agents` lists who is running. Reply in a thread to keep talking in it."
+	s := "A DM with me reaches the Hive's lead. `channels` lists the channels and whom each reaches; in one shared by several projects, `<project>: …` reaches that project's lead and anything else the lead."
+	return s + "\n`to <agent>: …` reaches a running agent (its id, the end of its id, or its name); `to <project>: …` a project's lead. `agents` lists who is running. Reply in a thread to keep talking in it.\n" + usage
 }
 
 func (b *Bridge) agents() string {
@@ -871,9 +908,17 @@ func (b *Bridge) reply(ctx context.Context, channel, root, text string) {
 }
 
 // fromHive puts one chat.posted line in the outbox for Slack.
-func (b *Bridge) fromHive(e hive.Event) {
+func (b *Bridge) fromHive(ctx context.Context, e hive.Event) {
 	var m hive.Message
 	if json.Unmarshal(e.Data, &m) != nil || m.Text == "" {
+		return
+	}
+	if line, ok := Command(m.Text); ok && (m.From == "person" || b.isLead(m.From)) {
+		// The lead (or the person) steering the module's channels: done
+		// here and answered in the same Hive thread, not sent to Slack.
+		if _, err := b.Hive.Post(ctx, m.Chat, m.Thread, b.command(ctx, line)); err != nil {
+			b.logf("hive post: %v", err)
+		}
 		return
 	}
 	if m.From == "person" || m.From == b.Name {
@@ -921,9 +966,17 @@ func (b *Bridge) deliver(ctx context.Context, m hive.Message) error {
 	return nil
 }
 
+// isLead says whether a run is a lead, the Hive's or a project's.
+func (b *Bridge) isLead(id string) bool {
+	if r, ok := b.st.Runs[id]; ok && r.Role != "" {
+		return r.Role == "lead"
+	}
+	return strings.HasPrefix(id, "lead-")
+}
+
 // channelFor is the Slack channel a chat's new threads go to.
 func (b *Bridge) channelFor(chat string) string {
-	lead := b.Cfg.Lead
+	lead := b.leadChannel()
 	if lead == "" {
 		lead = b.st.LeadDM
 	}
@@ -931,7 +984,7 @@ func (b *Bridge) channelFor(chat string) string {
 	case chat == "lead":
 		return lead
 	case strings.HasPrefix(chat, "project:"):
-		return b.projects[strings.TrimPrefix(chat, "project:")].Channel
+		return b.projectChannel(strings.TrimPrefix(chat, "project:"))
 	case strings.HasPrefix(chat, "agent:"):
 		return lead // an agent that writes to the person unasked
 	}
